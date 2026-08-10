@@ -494,7 +494,19 @@ export interface AnalyzeConsolidatedMeta {
 /* 10. POST /request-timeline                                                 */
 /* -------------------------------------------------------------------------- */
 
-export type TimelineJobStatus = "pending" | "completed" | "failed";
+/**
+ * Job status values stored on the `case_jobs` record behind the timeline
+ * endpoints. `running` only ever appears on GET /get-timeline, never on the
+ * POST /request-timeline response. The union is widened with `(string & {})`
+ * because the job type on the server side is extensible, so a future status
+ * will not break type checking for callers.
+ */
+export type TimelineJobStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | (string & {});
 
 /** An order document as returned in `orders[]` by both timeline endpoints. */
 export interface OrderDocument {
