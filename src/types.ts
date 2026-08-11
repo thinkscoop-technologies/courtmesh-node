@@ -174,7 +174,6 @@ export interface SearchHit {
   documentTypes?: string[];
   practiceAreas?: string[];
   precedentValue?: string;
-  s3Key?: string;
   createdAt?: string;
   updatedAt?: string;
   /** The mapping documents more fields than any one hit is guaranteed to carry. */
@@ -521,9 +520,8 @@ export interface OrderDocument {
   judge?: string;
   petitioners?: string[];
   respondents?: string[];
+  /** Whether a document exists. The API never discloses where it is stored. */
   hasS3Key?: boolean;
-  s3Key?: string;
-  s3Bucket?: string;
 }
 
 export interface RequestTimelineResult {
