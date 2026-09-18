@@ -564,6 +564,56 @@ describe("13. screenParty", () => {
     expect(result.data.summary.verdict).toBe("no_matches_found");
     expect(result.meta?.creditsCharged).toBe(20);
   });
+
+  it("accepts the live shape: a replayed idempotent response redacts query.name/aliases", async () => {
+    // Live-verified 2026-09-19: replaying the same Idempotency-Key + body
+    // returns query.name as { redacted: true, length } and query.aliases as
+    // { redacted: true, count } instead of the plain string/array sent on
+    // the original call - confirmed identically on both SDKs.
+    const { client } = makeClient([
+      {
+        status: 200,
+        headers: { "idempotency-replayed": "true" },
+        body: {
+          success: true,
+          data: {
+            query: {
+              name: { redacted: true, length: 8 },
+              aliases: { redacted: true, count: 0 },
+              entityType: "person",
+              purpose: "research",
+              limit: 10,
+              adjudicate: false,
+              displayThreshold: 0.6,
+            },
+            summary: { matchCount: 0, byBand: { confirmed: 0, probable: 0, possible: 0, unlikely: 0 }, highestBand: null, verdict: "no_matches_found" },
+            matches: [],
+            relatedButUnverified: [],
+            coverage: {
+              exhaustive: true,
+              exhaustiveWithinFilters: true,
+              planClamped: false,
+              anyStrategyErrored: false,
+              strategiesRun: ["exact"],
+              someRecordsWithheld: false,
+            },
+            adjudicationsRun: 0,
+            notice: "Results are public court records.",
+          },
+          meta: { creditsCharged: 20, adjudicated: false, corpusAsOf: "2026-09-17" },
+        },
+      },
+    ]);
+
+    const result = await client.screenParty(
+      { name: "Poojitha", entityType: "person", purpose: "research" },
+      { idempotencyKey: "same-key" },
+    );
+
+    expect(result.replayed).toBe(true);
+    const name = result.data.query.name;
+    expect(typeof name === "object" && "redacted" in name && name.length).toBe(8);
+  });
 });
 
 describe("14. coverage", () => {
@@ -667,6 +717,54 @@ describe("15. usage", () => {
     expect(calls[0]?.method).toBe("GET");
     expect(calls[0]?.url).toContain("/usage");
   });
+
+  it("accepts the live shape: an Enterprise key's uncapped limits are null, and meta.selfServe", async () => {
+    // Live-verified 2026-09-19: every UsageTierLimits field but
+    // requestsPerMinute came back null (not -1, not true/false) for an
+    // Enterprise key, and meta carried an undocumented selfServe flag.
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            tier: "enterprise",
+            walletOwner: { type: "user", id: "u1" },
+            balance: { total: 0, monthlyGrant: 0, signupGrant: 0, purchased: 0 },
+            limits: {
+              requestsPerMinute: 10,
+              requestsPerDay: null,
+              requestsPerMonth: null,
+              maxPageSize: null,
+              maxPaginationDepth: null,
+              distinctCaseFetchesPerDay: null,
+              pdfCallsPerMonth: null,
+              aiCallsPerMonth: null,
+              concurrentAnalyzeJobs: null,
+              apiKeys: null,
+              semanticSearchAllowed: null,
+              liveFetchAllowed: null,
+              liveFetchesPerDay: null,
+              analysisReadAllowed: null,
+              partyScreensPerMonth: null,
+            },
+            period: { start: "2026-08-31T18:30:00.000Z", end: "2026-09-30T18:29:59.999Z", key: "2026-09" },
+            creditsUsedThisPeriod: 0,
+            byEndpoint: [],
+            subscriptionRenewsAt: null,
+          },
+          meta: { requestId: "req-usage-2", selfServe: false },
+        },
+      },
+    ]);
+
+    const result = await client.usage();
+
+    expect(result.data.limits.requestsPerMinute).toBe(10);
+    expect(result.data.limits.requestsPerDay).toBeNull();
+    expect(result.data.limits.semanticSearchAllowed).toBeNull();
+    expect(result.meta?.selfServe).toBe(false);
+  });
 });
 
 describe("16. health(deep)", () => {
@@ -697,8 +795,31 @@ describe("16. health(deep)", () => {
     ]);
     const result = await client.health({ deep: true });
     expect(result.status).toBe("degraded");
-    expect(result.checks?.opensearch?.status).toBe("degraded");
+    const opensearch = result.checks?.opensearch;
+    expect(typeof opensearch === "object" && opensearch?.status).toBe("degraded");
     expect(calls[0]?.url).toContain("deep=1");
+  });
+
+  it("accepts the live shape: checks values are bare status strings, not objects", async () => {
+    // Live-verified 2026-09-19: the deployed server sends checks as
+    // Record<string, "ok" | "degraded" | "down">, never the richer
+    // { status, latencyMs?, error? } object this SDK originally (and still
+    // optionally) documents.
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          status: "healthy",
+          version: "1.2.0",
+          checks: { mongo: "ok", opensearch: "ok", qdrant: "ok", redis: "ok", iam: "ok" },
+          timestamp: "2026-09-18T20:14:22.870Z",
+        },
+      },
+    ]);
+    const result = await client.health({ deep: true });
+    expect(result.checks?.mongo).toBe("ok");
+    expect(result.checks?.opensearch).toBe("ok");
   });
 });
 
@@ -742,6 +863,42 @@ describe("18. audit", () => {
     expect(result.pagination.total).toBe(1);
     expect(calls[0]?.url).toContain("userId=u1");
     expect(calls[0]?.url).toContain("limit=50");
+  });
+
+  it("accepts the live shape: hits carry ipHash, never ipAddress", async () => {
+    // Live-verified 2026-09-19: every hit's IP field on the wire is
+    // ipHash (a SHA-256 hex digest), not ipAddress - this SDK's AuditHit
+    // type documented a field that has never actually appeared.
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            hits: [
+              {
+                id: "h1",
+                endpoint: "/api/v1/prod/me",
+                method: "GET",
+                statusCode: 200,
+                responseTime: 2,
+                createdAt: "2026-09-18T00:00:00.000Z",
+                ipHash: "4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f",
+                userAgent: "courtmesh-node/0.4.0",
+              },
+            ],
+            summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 2, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 0 },
+            topEndpoints: [{ endpoint: "/api/v1/prod/me", count: 1 }],
+          },
+          pagination: { total: 1, limit: 50, offset: 0, hasMore: false },
+        },
+      },
+    ]);
+
+    const result = await client.audit();
+
+    expect(result.data.hits[0]?.ipHash).toBe("4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f");
+    expect(result.data.hits[0]?.userAgent).toBe("courtmesh-node/0.4.0");
   });
 });
 

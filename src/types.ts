@@ -673,6 +673,18 @@ export interface HealthCheckResult {
 }
 
 /**
+ * Live-verified 2026-09-19: the deployed server sends each `checks` entry as
+ * a bare status string (for example `"ok"`), not a `HealthCheckResult`
+ * object - `latencyMs`/`error` were never observed on the wire. Both shapes
+ * are accepted here (a `HealthCheckResult` is kept as the richer,
+ * historically-documented variant in case a future or different deployment
+ * sends the object form) rather than narrowing to just the string, so this
+ * type never has to change again purely because the server started sending
+ * more detail per dependency.
+ */
+export type HealthCheckEntry = HealthCheckResult["status"] | HealthCheckResult;
+
+/**
  * Not enveloped in `data`, this endpoint has its own top level shape.
  *
  * `commit`, `checks` and `requestId` are only present when the plain form
@@ -690,8 +702,8 @@ export interface HealthResponse {
   version: string;
   /** The deployed commit SHA, or `null` when the server has no `GIT_SHA` set. */
   commit?: string | null;
-  /** Present only when `deep: true` was passed: one entry per dependency (Mongo, OpenSearch, Qdrant, Redis, IAM). */
-  checks?: Record<string, HealthCheckResult>;
+  /** Present only when `deep: true` was passed: one entry per dependency (Mongo, OpenSearch, Qdrant, Redis, IAM). See `HealthCheckEntry`. */
+  checks?: Record<string, HealthCheckEntry>;
   timestamp: string;
   requestId?: string;
 }
@@ -861,10 +873,32 @@ export interface PartyScreenCoverage {
   someRecordsWithheld: boolean;
 }
 
-/** The normalised request, echoed back for audit trails. */
+/** Live-verified 2026-09-19: shape of `query.name` on a replayed idempotent `party/screen` response, in place of the plain string sent on the original call. */
+export interface PartyScreenRedactedName {
+  redacted: true;
+  length: number;
+}
+
+/** Live-verified 2026-09-19: shape of `query.aliases` on a replayed idempotent `party/screen` response, in place of the plain array sent on the original call. */
+export interface PartyScreenRedactedAliases {
+  redacted: true;
+  count: number;
+}
+
+/**
+ * The normalised request, echoed back for audit trails.
+ *
+ * `name` and `aliases` are the plain values sent on the original call, but
+ * live-verified 2026-09-19: when this is a replayed idempotent response
+ * (`response.replayed === true`, `Idempotency-Replayed: true` on the wire),
+ * the server redacts both instead of echoing them back - `name` becomes
+ * `{ redacted: true, length }` and `aliases` becomes
+ * `{ redacted: true, count }`. Narrow on `"redacted" in query.name` (or
+ * check `response.replayed`) before treating either as the original value.
+ */
 export interface PartyScreenQueryEcho {
-  name: string;
-  aliases: string[];
+  name: string | PartyScreenRedactedName;
+  aliases: string[] | PartyScreenRedactedAliases;
   entityType: PartyEntityType;
   purpose: PartyScreenPurpose | string;
   /** The single court filter actually applied (never the raw request's array-or-string shape), absent when none was supplied. */
@@ -976,23 +1010,34 @@ export interface UsageBalance {
   purchased: number;
 }
 
-/** Mirrors the server's `TierLimits` (server/config/api-tiers.ts). `-1` means unlimited on any per period field. */
+/**
+ * Mirrors the server's `TierLimits` (server/config/api-tiers.ts). `-1` means
+ * unlimited on any per period field for a tier that has a numbered cap.
+ *
+ * Live-verified 2026-09-19 on an Enterprise key: every field below other
+ * than `requestsPerMinute` came back `null`, not `-1` and not `true`/`false`
+ * - this tier apparently has no configured cap at all for those fields
+ * rather than an explicit "unlimited" sentinel. Every field except
+ * `requestsPerMinute` is typed nullable to match; treat `null` the same as
+ * `-1`/unlimited (or "allowed") unless you have evidence a given tier
+ * distinguishes the two.
+ */
 export interface UsageTierLimits {
   requestsPerMinute: number;
-  requestsPerDay: number;
-  requestsPerMonth: number;
-  maxPageSize: number;
-  maxPaginationDepth: number;
-  distinctCaseFetchesPerDay: number;
-  pdfCallsPerMonth: number;
-  aiCallsPerMonth: number;
-  concurrentAnalyzeJobs: number;
-  apiKeys: number;
-  semanticSearchAllowed: boolean;
-  liveFetchAllowed: boolean;
-  liveFetchesPerDay: number;
-  analysisReadAllowed: boolean;
-  partyScreensPerMonth: number;
+  requestsPerDay: number | null;
+  requestsPerMonth: number | null;
+  maxPageSize: number | null;
+  maxPaginationDepth: number | null;
+  distinctCaseFetchesPerDay: number | null;
+  pdfCallsPerMonth: number | null;
+  aiCallsPerMonth: number | null;
+  concurrentAnalyzeJobs: number | null;
+  apiKeys: number | null;
+  semanticSearchAllowed: boolean | null;
+  liveFetchAllowed: boolean | null;
+  liveFetchesPerDay: number | null;
+  analysisReadAllowed: boolean | null;
+  partyScreensPerMonth: number | null;
 }
 
 /** The [start, end] ISO timestamps of the Asia/Kolkata calendar month this usage was aggregated over. */
@@ -1022,6 +1067,8 @@ export interface UsageData {
 
 export interface UsageMeta {
   requestId: string;
+  /** Live-verified 2026-09-19, undocumented until now: whether this account is on the API self-serve tiers flag. */
+  selfServe?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1067,7 +1114,12 @@ export interface AuditHit {
   isAiAnalysis?: boolean;
   creditsDeducted?: number;
   metadata?: Record<string, unknown>;
-  ipAddress?: string;
+  /**
+   * Live-verified 2026-09-19: the server sends `ipHash` (a SHA-256 hex
+   * digest of the caller's IP), never `ipAddress` - the field this SDK
+   * documented until now does not appear on the wire at all.
+   */
+  ipHash?: string;
   userAgent?: string;
   createdAt: string;
 }

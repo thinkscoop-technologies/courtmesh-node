@@ -92,6 +92,8 @@ export type {
   PartyScreenSummary,
   PartyScreenCoverage,
   PartyScreenQueryEcho,
+  PartyScreenRedactedName,
+  PartyScreenRedactedAliases,
   PartyScreenResult,
   PartyScreenMeta,
   CoverageByCourtType,
@@ -130,4 +132,5 @@ export type {
   PartyScreenBatchResult,
   PartyScreenBatchMeta,
   HealthCheckResult,
+  HealthCheckEntry,
 } from "./types.js";
