@@ -27,6 +27,19 @@ describe("auth header", () => {
   });
 });
 
+describe("User-Agent header", () => {
+  it("identifies this SDK and its version on every request, including GET /health", async () => {
+    const { client, calls } = makeClient([
+      { status: 200, body: { success: true, data: ["JUSTICE A"] } },
+      { status: 200, body: { success: true, status: "healthy", version: "1.0.0", timestamp: "2026-08-10T09:00:00.000Z" } },
+    ]);
+    await client.searchJudges({ q: "a" });
+    await client.health();
+    expect(calls[0]?.headers["user-agent"]).toMatch(/^courtmesh-node\/\d+\.\d+\.\d+$/);
+    expect(calls[1]?.headers["user-agent"]).toMatch(/^courtmesh-node\/\d+\.\d+\.\d+$/);
+  });
+});
+
 describe("1. searchJudges", () => {
   it("unwraps the envelope and exposes meta", async () => {
     const { client } = makeClient([

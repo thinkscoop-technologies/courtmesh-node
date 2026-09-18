@@ -52,6 +52,17 @@ import type {
   UsageMeta,
 } from "./types.js";
 
+/**
+ * Injected at build time by tsup's `define` (see tsup.config.ts) from
+ * package.json's `version`. Falls back to a literal below only when this
+ * file is consumed unbuilt (for example a test importing straight from
+ * `src/`), so `User-Agent` is never blank.
+ */
+declare const __SDK_VERSION__: string;
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.4.0";
+/** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
+const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
+
 /** A fetch compatible function, this is what the `fetch` option and the global `fetch` both satisfy. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -784,7 +795,7 @@ export class CourtMeshClient {
   }
 
   private buildHeaders(hasBody: boolean, skipAuth: boolean, idempotencyKey?: string): Record<string, string> {
-    const headers: Record<string, string> = { Accept: "application/json" };
+    const headers: Record<string, string> = { Accept: "application/json", "User-Agent": USER_AGENT };
     if (!skipAuth && this.apiKey) {
       headers.Authorization = `Bearer ${this.apiKey}`;
     }
