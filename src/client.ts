@@ -1,4 +1,4 @@
-import { CourtMeshError, mapStatusToError } from "./errors.js";
+import { CourtMeshError, isRetryable429Code, mapStatusToError, RateLimitError } from "./errors.js";
 import type {
   AnalyzeCaseMeta,
   AnalyzeCaseOptions,
@@ -10,16 +10,22 @@ import type {
   CaseAnalysis,
   CaseDetails,
   CaseListItem,
+  CoverageData,
+  CoverageMeta,
   GetCaseAnalysisMeta,
   GetCaseMeta,
   GetPdfMeta,
   GetTimelineMeta,
   HealthResponse,
   KeywordSearchPagination,
+  PartyScreenMeta,
+  PartyScreenOptions,
+  PartyScreenResult,
   PdfResponse,
   RelatedMeta,
   RelatedResponse,
   RequestTimelineMeta,
+  RequestTimelineOptions,
   RequestTimelineResult,
   SearchCasesMeta,
   SearchCasesOptions,
@@ -44,18 +50,69 @@ export interface CourtMeshClientOptions {
   baseUrl?: string;
   /** Maximum number of retry attempts for retryable failures. Defaults to 3. */
   maxRetries?: number;
-  /** Per request timeout in milliseconds, enforced with AbortController. Defaults to 30000. Set to 0 to disable. */
+  /**
+   * Per request timeout in milliseconds, enforced with AbortController.
+   * Defaults to 30000, except on the endpoints with their own longer default
+   * (semantic search: 630000, request-timeline: 240000,
+   * analyze-consolidated: 300000, party screen: 90000 - all run far longer
+   * server side than a typical call).
+   * Set to 0 to disable. Overridable per call via that method's
+   * `requestOptions.timeoutMs`. A client side timeout does not cancel the
+   * request server side and never triggers a refund - the call may still
+   * complete (and be billed) after the SDK has already thrown.
+   */
   timeoutMs?: number;
+  /**
+   * Allow retrying a POST request after it has already reached the network
+   * (a read timeout, a network error, or a 502/503/504 response) (R3).
+   * Default false: a POST that may have already been received and acted on
+   * server side is not retried automatically, to avoid double charging or
+   * double running a job (analyze, party/screen, and similar). A 429
+   * response is a pre-flight refusal - no work was done - so it is retried
+   * regardless of this setting, subject to `isRetryable429Code`.
+   * Overridable per call via that method's `requestOptions.retryPosts`.
+   */
+  retryPosts?: boolean;
+  /**
+   * Caps how long this client will wait on a `Retry-After`/`retryAfter` it
+   * is honouring for a 429, in seconds. Default 60 (R1). When the
+   * advertised delay is longer than this (a daily or monthly cap can carry a
+   * `Retry-After` of up to a day), the SDK does not sleep and retry: it
+   * raises `RateLimitError` immediately, with `retryAfterSeconds` set to the
+   * real (uncapped) delay the server advertised, so the caller can decide
+   * for itself whether to wait that long.
+   */
+  maxRetryAfterSeconds?: number;
   /** Inject a custom fetch implementation, primarily for testing. Defaults to the global `fetch`. */
   fetch?: FetchLike;
+}
+
+/** Per call override of the client's request behaviour for one request. */
+export interface RequestConfig {
+  /** Overrides the client's default timeout (or this endpoint's own default) for this one call. */
+  timeoutMs?: number;
+  /** Overrides the client's `retryPosts` default for this one call. Meaningless on a GET. */
+  retryPosts?: boolean;
 }
 
 const DEFAULT_BASE_URL = "https://research.courtmesh.ai/api/v1/prod";
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_RETRY_AFTER_SECONDS = 60;
 const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 const MAX_BACKOFF_MS = 30000;
 const BASE_BACKOFF_MS = 500;
+
+/**
+ * Per endpoint request timeout defaults (R4), in milliseconds. Endpoints not
+ * listed here use the client's general `timeoutMs` (default 30000).
+ */
+const ENDPOINT_TIMEOUT_MS = {
+  semanticSearch: 630_000,
+  requestTimeline: 240_000,
+  analyzeConsolidated: 300_000,
+  screenParty: 90_000,
+} as const;
 
 /** The maximum number of pages an async iterator will walk before it gives up as a safety guard. */
 const MAX_ITERATOR_PAGES = 10000;
@@ -78,18 +135,19 @@ function computeBackoffMs(attempt: number): number {
   return capped + jitter;
 }
 
-function computeRetryDelayMs(response: Response, body: unknown, attempt: number): number {
+/** The advertised retry delay for a 429, in whole seconds: the `Retry-After` header if present and valid, else the JSON body's `retryAfter` field. `undefined` when neither is present, meaning "the server did not tell us how long to wait." */
+function extractAdvertisedRetryAfterSeconds(response: Response, body: unknown): number | undefined {
   const header = response.headers.get("retry-after");
   if (header) {
     const seconds = Number(header);
     if (!Number.isNaN(seconds) && seconds >= 0) {
-      return seconds * 1000;
+      return seconds;
     }
   }
-  if (isRecord(body) && typeof body.retryAfter === "number") {
-    return body.retryAfter * 1000;
+  if (isRecord(body) && typeof body.retryAfter === "number" && body.retryAfter >= 0) {
+    return body.retryAfter;
   }
-  return computeBackoffMs(attempt);
+  return undefined;
 }
 
 function extractErrorMessage(body: unknown, status: number): string {
@@ -104,26 +162,43 @@ function extractErrorMessage(body: unknown, status: number): string {
   return `Request failed with status ${status}`;
 }
 
+function extractApiCode(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.code === "string" ? body.code : undefined;
+}
+
 interface RequestOptions {
   method: "GET" | "POST";
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
+  /** No `Authorization` header, for `GET /health`. */
+  skipAuth?: boolean;
+  /** Per call timeout override. Falls back to the endpoint default, then the client's own `timeoutMs`. */
+  timeoutMs?: number;
+  /** Per call override of the client's `retryPosts` default. */
+  retryPosts?: boolean;
 }
 
 /**
- * Client for the CourtMesh Enterprise API.
+ * Client for the CourtMesh API.
  *
- * Uses the global `fetch`, no runtime dependencies. Retries 429, 502, 503
- * and 504 responses plus network errors with exponential backoff and
- * jitter, honouring `Retry-After` first, then the JSON body's `retryAfter`
- * in seconds.
+ * Uses the global `fetch`, no runtime dependencies. Retries a 429 whose
+ * `code` is `RATE_LIMITED` or `CONCURRENT_ANALYSIS_LIMIT` (never a daily or
+ * monthly cap code, see `isRetryable429Code`) and, for GET requests only by
+ * default, 502/503/504 responses and network level failures - all with
+ * exponential backoff and jitter unless the server advertised its own delay
+ * via `Retry-After` or the JSON body's `retryAfter`. See `retryPosts` on
+ * `CourtMeshClientOptions` to also retry POST requests, and
+ * `maxRetryAfterSeconds` for the cap on how long a 429 is retried
+ * automatically before the SDK gives up and throws instead of waiting.
  */
 export class CourtMeshClient {
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly maxRetries: number;
   private readonly timeoutMs: number;
+  private readonly retryPosts: boolean;
+  private readonly maxRetryAfterSeconds: number;
   private readonly fetchImpl: FetchLike;
 
   constructor(options: CourtMeshClientOptions = {}) {
@@ -131,6 +206,8 @@ export class CourtMeshClient {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.retryPosts = options.retryPosts ?? false;
+    this.maxRetryAfterSeconds = options.maxRetryAfterSeconds ?? DEFAULT_MAX_RETRY_AFTER_SECONDS;
 
     const injected = options.fetch ?? (typeof fetch === "function" ? (fetch as FetchLike) : undefined);
     if (!injected) {
@@ -157,11 +234,13 @@ export class CourtMeshClient {
   /* 2. POST /search/cases                                                  */
   /* ---------------------------------------------------------------------- */
 
-  async searchCases(options: SearchCasesOptions): Promise<SearchCasesResponse> {
+  async searchCases(options: SearchCasesOptions, requestOptions: RequestConfig = {}): Promise<SearchCasesResponse> {
     const response = await this.request<SearchCasesResponse>({
       method: "POST",
       path: "/search/cases",
       body: options,
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
     });
     return response;
   }
@@ -169,14 +248,33 @@ export class CourtMeshClient {
   /**
    * Walks `POST /search/cases` page by page, yielding one page of hits at a
    * time. Stops when a page comes back empty or `pagination.hasMore` is
-   * false. Uses page/limit pagination, starting from `options.page` (or 1).
+   * false. Default page size is 20 (also the Free tier's own cap; higher
+   * tiers allow more, but 20 is a safe default for every tier).
+   *
+   * Cursor-first: once a page's `pagination.nextCursor` comes back, it is
+   * passed back as `cursor` on the next call (the current, self-serve
+   * pagination mechanism) rather than incrementing `page`. If the account
+   * is on the legacy path instead, `nextCursor` comes back as a raw array
+   * and this walks it via `searchAfter` instead - either way, you never have
+   * to branch on which shape your account gets. `PAGE_LIMIT_EXCEEDED` and
+   * `PAGINATION_DEPTH_EXCEEDED` surface as a typed `ValidationError`, same as
+   * calling `searchCases` directly.
    */
   async *iterSearchCases(options: SearchCasesOptions): AsyncGenerator<SearchHit[], void, unknown> {
     const limit = options.limit ?? 20;
     let page = options.page ?? 1;
+    let cursor = options.cursor;
+    let searchAfter = options.searchAfter;
 
     for (let i = 0; i < MAX_ITERATOR_PAGES; i++) {
-      const response = await this.searchCases({ ...options, page, limit });
+      const usingCursor = typeof cursor === "string" && cursor.length > 0;
+      const response = await this.searchCases({
+        ...options,
+        limit,
+        page: usingCursor ? undefined : page,
+        cursor,
+        searchAfter: usingCursor ? undefined : searchAfter,
+      });
       const data = response.data ?? [];
       if (data.length === 0) {
         return;
@@ -185,7 +283,21 @@ export class CourtMeshClient {
       if (!response.pagination.hasMore) {
         return;
       }
-      page += 1;
+
+      const nextCursor = response.pagination.nextCursor;
+      if (typeof nextCursor === "string" && nextCursor.length > 0) {
+        // Current, self-serve mechanism: hand the signed cursor straight back.
+        cursor = nextCursor;
+        searchAfter = undefined;
+      } else if (Array.isArray(nextCursor) && nextCursor.length > 0) {
+        // Legacy path: continue via a JSON-encoded searchAfter instead.
+        cursor = undefined;
+        searchAfter = JSON.stringify(nextCursor);
+        page += 1;
+      } else {
+        cursor = undefined;
+        page += 1;
+      }
     }
 
     throw new Error(
@@ -199,15 +311,22 @@ export class CourtMeshClient {
   /* ---------------------------------------------------------------------- */
 
   /**
-   * Throws if the response body has `success: false`, even though the
-   * server sends HTTP 200 for failures that happen after it has already
-   * started writing the response (a documented transport quirk).
+   * Defensive fallback only: the server sends a proper non-200 status for a
+   * semantic search failure today (`sendSemanticFailure`,
+   * `routes/api-v1-prod.ts`), so this branch should never trigger in
+   * practice. It stays as a belt-and-braces check in case a future response
+   * ever starts streaming before failing.
    */
-  async semanticSearch(options: SemanticSearchOptions): Promise<SemanticSearchResponse> {
+  async semanticSearch(
+    options: SemanticSearchOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<SemanticSearchResponse> {
     const json = await this.request<Record<string, unknown>>({
       method: "POST",
       path: "/search/cases/semantic",
       body: options,
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.semanticSearch,
+      retryPosts: requestOptions.retryPosts,
     });
 
     if (json.success === false) {
@@ -251,10 +370,11 @@ export class CourtMeshClient {
   /* 4. GET /cases/{id}                                                     */
   /* ---------------------------------------------------------------------- */
 
-  async getCase(id: string): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
+  async getCase(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
     return this.request<ApiResponse<CaseDetails, GetCaseMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}`,
+      timeoutMs: requestOptions.timeoutMs,
     });
   }
 
@@ -262,10 +382,14 @@ export class CourtMeshClient {
   /* 5. GET /cases/{id}/analysis                                            */
   /* ---------------------------------------------------------------------- */
 
-  async getCaseAnalysis(id: string): Promise<ApiResponse<CaseAnalysis, GetCaseAnalysisMeta>> {
+  async getCaseAnalysis(
+    id: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<CaseAnalysis, GetCaseAnalysisMeta>> {
     return this.request<ApiResponse<CaseAnalysis, GetCaseAnalysisMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}/analysis`,
+      timeoutMs: requestOptions.timeoutMs,
     });
   }
 
@@ -273,10 +397,14 @@ export class CourtMeshClient {
   /* 6. GET /cases/{id}/related                                             */
   /* ---------------------------------------------------------------------- */
 
-  async getRelated(id: string): Promise<ApiResponse<RelatedResponse, RelatedMeta>> {
+  async getRelated(
+    id: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<RelatedResponse, RelatedMeta>> {
     return this.request<ApiResponse<RelatedResponse, RelatedMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}/related`,
+      timeoutMs: requestOptions.timeoutMs,
     });
   }
 
@@ -284,10 +412,18 @@ export class CourtMeshClient {
   /* 7. GET /cases/{id}/pdf                                                 */
   /* ---------------------------------------------------------------------- */
 
-  async getCasePdf(id: string): Promise<ApiResponse<PdfResponse, GetPdfMeta>> {
+  /**
+   * `PDF_NOT_STORED` (404) means no stored document exists for this case;
+   * `POST /request-timeline` with `refresh: true` may fetch orders for High
+   * Court and District Court cases (tribunal documents are not fetchable via
+   * this API). `CASE_NOT_FOUND` (404) and `CASE_RESTRICTED` (403) are the
+   * other two documented failure codes for this endpoint.
+   */
+  async getCasePdf(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<PdfResponse, GetPdfMeta>> {
     return this.request<ApiResponse<PdfResponse, GetPdfMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}/pdf`,
+      timeoutMs: requestOptions.timeoutMs,
     });
   }
 
@@ -295,14 +431,23 @@ export class CourtMeshClient {
   /* 8. POST /cases/{id}/analyze                                           */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Starts (or reads back an already-complete) AI analysis for one case,
+   * 202 Accepted, processed in the background. `allowRemoteFetch: true` is
+   * required when the case has no stored document and can only be analyzed
+   * by fetching it from an external URL - see `AnalyzeCaseOptions`.
+   */
   async analyzeCase(
     id: string,
     options: AnalyzeCaseOptions = {},
+    requestOptions: RequestConfig = {},
   ): Promise<ApiResponse<AnalyzeCaseResult, AnalyzeCaseMeta>> {
     return this.request<ApiResponse<AnalyzeCaseResult, AnalyzeCaseMeta>>({
       method: "POST",
       path: `/cases/${encodeURIComponent(id)}/analyze`,
-      body: { force: options.force ?? false },
+      body: { force: options.force ?? false, ...(options.allowRemoteFetch ? { allowRemoteFetch: true } : {}) },
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
     });
   }
 
@@ -313,11 +458,14 @@ export class CourtMeshClient {
   async analyzeConsolidated(
     id: string,
     options: AnalyzeConsolidatedOptions = {},
+    requestOptions: RequestConfig = {},
   ): Promise<ApiResponse<AnalyzeConsolidatedResult, AnalyzeConsolidatedMeta>> {
     return this.request<ApiResponse<AnalyzeConsolidatedResult, AnalyzeConsolidatedMeta>>({
       method: "POST",
       path: `/cases/${encodeURIComponent(id)}/analyze-consolidated`,
       body: { force: options.force ?? false },
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.analyzeConsolidated,
+      retryPosts: requestOptions.retryPosts,
     });
   }
 
@@ -325,11 +473,25 @@ export class CourtMeshClient {
   /* 10. POST /request-timeline                                            */
   /* ---------------------------------------------------------------------- */
 
-  async requestTimeline(caseId: string): Promise<ApiResponse<RequestTimelineResult, RequestTimelineMeta>> {
+  /**
+   * Requests (or reads back a cached) order/document timeline for a case.
+   * `options.refresh: true` forces a live court-portal fetch instead of
+   * serving the last stored read - see `RequestTimelineOptions`. The
+   * response's `meta.liveFetch` says which one actually happened, and
+   * `data.liveFetchSupported` comes back `false` when this case's court does
+   * not support a live refresh at all.
+   */
+  async requestTimeline(
+    caseId: string,
+    options: RequestTimelineOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<RequestTimelineResult, RequestTimelineMeta>> {
     return this.request<ApiResponse<RequestTimelineResult, RequestTimelineMeta>>({
       method: "POST",
       path: "/request-timeline",
-      body: { case_id: caseId },
+      body: { case_id: caseId, ...(options.refresh ? { refresh: true } : {}) },
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.requestTimeline,
+      retryPosts: requestOptions.retryPosts,
     });
   }
 
@@ -337,10 +499,14 @@ export class CourtMeshClient {
   /* 11. GET /get-timeline/{requestId}                                     */
   /* ---------------------------------------------------------------------- */
 
-  async getTimeline(requestId: string): Promise<ApiResponse<TimelineJob, GetTimelineMeta>> {
+  async getTimeline(
+    requestId: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<TimelineJob, GetTimelineMeta>> {
     return this.request<ApiResponse<TimelineJob, GetTimelineMeta>>({
       method: "GET",
       path: `/get-timeline/${encodeURIComponent(requestId)}`,
+      timeoutMs: requestOptions.timeoutMs,
     });
   }
 
@@ -349,8 +515,63 @@ export class CourtMeshClient {
   /* ---------------------------------------------------------------------- */
 
   /** No auth required, not rate limited, not enveloped in `data`. */
-  async health(): Promise<HealthResponse> {
-    return this.request<HealthResponse>({ method: "GET", path: "/health", query: undefined }, { skipAuth: true });
+  async health(requestOptions: RequestConfig = {}): Promise<HealthResponse> {
+    return this.request<HealthResponse>({
+      method: "GET",
+      path: "/health",
+      query: undefined,
+      skipAuth: true,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 13. POST /party/screen                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Screens a person or company name against the case law corpus for
+   * litigation, insolvency and related court records. Requires an API key.
+   *
+   * Costs 100 credits when matches are found, 20 when none are, plus a flat
+   * surcharge only when `result.adjudicationsRun > 0` (requesting
+   * `adjudicate: true` alone does not guarantee a model call happened, and
+   * does not by itself bill the surcharge - see `PartyScreenOptions.adjudicate`
+   * and `PartyScreenResult.adjudicationsRun`). See the DPDP note in the
+   * README: `purpose` is required, results are public court records, and a
+   * screen is not an identity check. Every priced endpoint including this
+   * one pre-flight reserves the charge before doing any work: a shortfall
+   * throws `InsufficientCreditsError` (402) before the screen runs.
+   */
+  async screenParty(
+    options: PartyScreenOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<PartyScreenResult, PartyScreenMeta>> {
+    return this.request<ApiResponse<PartyScreenResult, PartyScreenMeta>>({
+      method: "POST",
+      path: "/party/screen",
+      body: options,
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.screenParty,
+      retryPosts: requestOptions.retryPosts,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 14. GET /coverage                                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Corpus coverage and freshness stats: totals, by court type, by year,
+   * per court, and a rolled up District Courts row. No API key is
+   * required, this SDK sends one anyway when the client is configured
+   * with one. Server side cached for up to 6 hours.
+   */
+  async coverage(requestOptions: RequestConfig = {}): Promise<ApiResponse<CoverageData, CoverageMeta>> {
+    return this.request<ApiResponse<CoverageData, CoverageMeta>>({
+      method: "GET",
+      path: "/coverage",
+      timeoutMs: requestOptions.timeoutMs,
+    });
   }
 
   /* ---------------------------------------------------------------------- */
@@ -379,31 +600,37 @@ export class CourtMeshClient {
     return headers;
   }
 
-  private async request<T>(opts: RequestOptions, requestConfig: { skipAuth?: boolean } = {}): Promise<T> {
+  private async request<T>(opts: RequestOptions): Promise<T> {
     const url = this.buildUrl(opts.path, opts.query);
     const maxAttempts = this.maxRetries + 1;
+    const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
+    // R3: a POST is only retried after it has reached the network (a network
+    // error, a read timeout, or a 502/503/504 response) when this call, or
+    // the client, opted in. A 429 is not gated by this - see below, it is a
+    // pre-flight refusal, not evidence the request was ever processed.
+    const canRetryAfterDispatch = opts.method === "GET" || (opts.retryPosts ?? this.retryPosts);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();
-      const timer = this.timeoutMs > 0 ? setTimeout(() => controller.abort(), this.timeoutMs) : undefined;
+      const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
 
       let response: Response;
       try {
         response = await this.fetchImpl(url, {
           method: opts.method,
-          headers: this.buildHeaders(opts.body !== undefined, requestConfig.skipAuth ?? false),
+          headers: this.buildHeaders(opts.body !== undefined, opts.skipAuth ?? false),
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
           signal: controller.signal,
         });
       } catch (error) {
         if (timer) clearTimeout(timer);
         const aborted = isAbortError(error);
-        if (!aborted && attempt < maxAttempts) {
+        if (!aborted && attempt < maxAttempts && canRetryAfterDispatch) {
           await delay(computeBackoffMs(attempt));
           continue;
         }
         if (aborted) {
-          throw new CourtMeshError(`Request timed out after ${this.timeoutMs}ms`, "request_timeout", 408, undefined);
+          throw new CourtMeshError(`Request timed out after ${timeoutMs}ms`, "request_timeout", 408, undefined);
         }
         throw new CourtMeshError(
           error instanceof Error ? error.message : "Network request failed",
@@ -423,14 +650,43 @@ export class CourtMeshClient {
           json = undefined;
         }
       }
+      const headerRequestId = response.headers.get("x-request-id") ?? undefined;
 
-      if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxAttempts) {
-        await delay(computeRetryDelayMs(response, json, attempt));
+      if (response.status === 429) {
+        const apiCode = extractApiCode(json);
+        const advertisedSeconds = extractAdvertisedRetryAfterSeconds(response, json);
+        const retryableCode = isRetryable429Code(apiCode);
+        const capExceeded = advertisedSeconds !== undefined && advertisedSeconds > this.maxRetryAfterSeconds;
+
+        if (retryableCode && capExceeded) {
+          // R1: do not sleep for longer than maxRetryAfterSeconds. Raise
+          // immediately instead, with the real (uncapped) delay attached so
+          // the caller can decide for itself whether to wait that long.
+          const mapped = mapStatusToError(429, extractErrorMessage(json, 429), json, headerRequestId);
+          if (mapped instanceof RateLimitError) {
+            throw new RateLimitError(mapped.message, json, advertisedSeconds, mapped.resetTime, {
+              apiCode: mapped.apiCode,
+              requestId: mapped.requestId,
+            });
+          }
+          throw mapped;
+        }
+
+        if (retryableCode && attempt < maxAttempts) {
+          const delayMs = advertisedSeconds !== undefined ? advertisedSeconds * 1000 : computeBackoffMs(attempt);
+          await delay(delayMs);
+          continue;
+        }
+
+        // Not a retryable code (a daily/monthly cap, R2) or attempts are
+        // exhausted: fall through to the generic throw below.
+      } else if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxAttempts && canRetryAfterDispatch) {
+        await delay(computeBackoffMs(attempt));
         continue;
       }
 
       if (!response.ok) {
-        throw mapStatusToError(response.status, extractErrorMessage(json, response.status), json);
+        throw mapStatusToError(response.status, extractErrorMessage(json, response.status), json, headerRequestId);
       }
 
       return json as T;

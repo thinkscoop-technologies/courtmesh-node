@@ -1,7 +1,7 @@
 {
   "name": "@courtmesh/sdk",
-  "version": "0.1.0",
-  "description": "Official TypeScript SDK for the CourtMesh Enterprise API.",
+  "version": "0.3.0",
+  "description": "Official TypeScript SDK for the CourtMesh API.",
   "license": "MIT",
   "author": "Thinkscoop Technologies LLP",
   "type": "module",

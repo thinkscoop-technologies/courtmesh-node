@@ -74,7 +74,7 @@ describe("2. searchCases", () => {
         status: 200,
         body: {
           success: true,
-          data: [{ _id: "1", _score: 1 }],
+          data: [{ id: "1", score: 1 }],
           pagination: { total: 2, hasMore: true, page: 1, limit: 1, nextCursor: null },
         },
       },
@@ -82,7 +82,7 @@ describe("2. searchCases", () => {
         status: 200,
         body: {
           success: true,
-          data: [{ _id: "2", _score: 1 }],
+          data: [{ id: "2", score: 1 }],
           pagination: { total: 2, hasMore: false, page: 2, limit: 1, nextCursor: null },
         },
       },
@@ -90,9 +90,39 @@ describe("2. searchCases", () => {
 
     const pages: string[] = [];
     for await (const page of client.iterSearchCases({ query: "x", limit: 1 })) {
-      for (const hit of page) pages.push(hit._id);
+      for (const hit of page) pages.push(hit.id);
     }
     expect(pages).toEqual(["1", "2"]);
+  });
+
+  it("walks pages with iterSearchCases using the signed cursor (self-serve on)", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: [{ id: "1", score: 1 }],
+          pagination: { total: 2, hasMore: true, limit: 1, nextCursor: "signed.cursor.token" },
+        },
+      },
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: [{ id: "2", score: 1 }],
+          pagination: { total: 2, hasMore: false, limit: 1, nextCursor: null },
+        },
+      },
+    ]);
+
+    const ids: string[] = [];
+    for await (const page of client.iterSearchCases({ query: "x", limit: 1 })) {
+      for (const hit of page) ids.push(hit.id);
+    }
+    expect(ids).toEqual(["1", "2"]);
+    expect(calls[0]?.body).toMatchObject({ page: 1 });
+    expect((calls[1]?.body as Record<string, unknown>)?.cursor).toBe("signed.cursor.token");
+    expect((calls[1]?.body as Record<string, unknown>)?.page).toBeUndefined();
   });
 
   it("stops iterSearchCases on an empty page", async () => {
@@ -165,7 +195,7 @@ describe("3. semanticSearch", () => {
     expect(ids).toEqual(["1", "2"]);
   });
 
-  it("sends the free-form filters object separately from the top level fields", async () => {
+  it("sends both the top level fields and the free-form filters object (filters wins on overlap, server side)", async () => {
     const { client, calls } = makeClient([
       {
         status: 200,
@@ -177,8 +207,8 @@ describe("3. semanticSearch", () => {
         },
       },
     ]);
-    await client.semanticSearch({ query: "x", court: "ignored", filters: { court: "Delhi HC", caseYear: 2024 } });
-    expect(calls[0]?.body).toMatchObject({ court: "ignored", filters: { court: "Delhi HC", caseYear: 2024 } });
+    await client.semanticSearch({ query: "x", court: "Bombay HC", filters: { court: "Delhi HC", caseYear: 2024 } });
+    expect(calls[0]?.body).toMatchObject({ court: "Bombay HC", filters: { court: "Delhi HC", caseYear: 2024 } });
   });
 });
 
@@ -307,6 +337,21 @@ describe("8. analyzeCase", () => {
     await client.analyzeCase("1", { force: true });
     expect(calls[0]?.body).toEqual({ force: true });
   });
+
+  it("passes allowRemoteFetch: true through only when requested", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 202,
+        body: {
+          success: true,
+          data: { message: "Analysis has been started", status: "processing" },
+          meta: { responseTime: "1ms", note: "" },
+        },
+      },
+    ]);
+    await client.analyzeCase("1", { allowRemoteFetch: true });
+    expect(calls[0]?.body).toEqual({ force: false, allowRemoteFetch: true });
+  });
 });
 
 describe("9. analyzeConsolidated", () => {
@@ -339,13 +384,31 @@ describe("10. requestTimeline", () => {
         body: {
           success: true,
           data: { requestId: "job1", status: "pending" },
-          meta: { responseTime: "3ms" },
+          meta: { liveFetch: false, responseTime: "3ms" },
         },
       },
     ]);
     const result = await client.requestTimeline("abc123");
     expect(result.data.requestId).toBe("job1");
+    expect(result.meta?.liveFetch).toBe(false);
     expect(calls[0]?.body).toEqual({ case_id: "abc123" });
+  });
+
+  it("sends refresh: true only when requested, and surfaces liveFetch/liveFetchSupported", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: { requestId: "job2", status: "completed", liveFetchSupported: false },
+          meta: { liveFetch: true, responseTime: "500ms" },
+        },
+      },
+    ]);
+    const result = await client.requestTimeline("abc123", { refresh: true });
+    expect(calls[0]?.body).toEqual({ case_id: "abc123", refresh: true });
+    expect(result.meta?.liveFetch).toBe(true);
+    expect(result.data.liveFetchSupported).toBe(false);
   });
 });
 
@@ -375,5 +438,187 @@ describe("12. health", () => {
     const result = await client.health();
     expect(result.status).toBe("healthy");
     expect(result.version).toBe("1.0.0");
+  });
+});
+
+describe("13. screenParty", () => {
+  it("sends the request body and unwraps matches, coverage and meta", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            query: { name: "Acme Textiles Pvt Ltd", aliases: [], entityType: "company", purpose: "due_diligence", limit: 40, displayThreshold: 0.5 },
+            summary: {
+              matchCount: 1,
+              byBand: { confirmed: 1, probable: 0, possible: 0, unlikely: 0 },
+              highestBand: "confirmed",
+              verdict: "matches_found",
+            },
+            matches: [
+              {
+                caseId: "abc123",
+                title: "Acme Textiles Pvt Ltd v. State",
+                court: "Delhi High Court",
+                petitioners: ["Acme Textiles Pvt Ltd"],
+                respondents: ["State"],
+                partyRole: "petitioner",
+                confidence: { band: "confirmed", score: 0.96, calibrated: 0.96, engine: "rules" },
+                evidence: {
+                  entityMatch: true,
+                  matchedFields: ["name", "gstin"],
+                  strategies: ["exact", "fuzzy"],
+                  signals: [{ name: "gstin_match", status: "matched", weight: "strong", evidence: "07AAAAA0000A1Z5" }],
+                  nameSimilarity: 0.98,
+                  disambiguatorPresent: true,
+                },
+                rationale: "GSTIN and name both match.",
+                casePageUrl: "https://research.courtmesh.ai/case/abc123",
+              },
+            ],
+            relatedButUnverified: [],
+            coverage: {
+              exhaustive: true,
+              exhaustiveWithinFilters: true,
+              planClamped: false,
+              anyStrategyErrored: false,
+              strategiesRun: ["exact", "fuzzy"],
+              someRecordsWithheld: false,
+            },
+            adjudicationsRun: 0,
+            notice: "Results are public court records. See the case removal policy for takedown requests.",
+          },
+          meta: { creditsCharged: 100, adjudicated: false, corpusAsOf: "2026-09-17" },
+        },
+      },
+    ]);
+
+    const result = await client.screenParty({
+      name: "Acme Textiles Pvt Ltd",
+      entityType: "company",
+      purpose: "due_diligence",
+      identifiers: { gstin: "07AAAAA0000A1Z5" },
+    });
+
+    expect(result.data.summary.verdict).toBe("matches_found");
+    expect(result.data.matches[0]?.confidence.band).toBe("confirmed");
+    expect(result.data.coverage.exhaustive).toBe(true);
+    expect(result.meta?.creditsCharged).toBe(100);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toContain("/party/screen");
+    expect(calls[0]?.body).toMatchObject({
+      name: "Acme Textiles Pvt Ltd",
+      entityType: "company",
+      purpose: "due_diligence",
+      identifiers: { gstin: "07AAAAA0000A1Z5" },
+    });
+  });
+
+  it("unwraps the no matches variant", async () => {
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            query: { name: "A Very Uncommon Name", aliases: [], entityType: "person", purpose: "kyc", limit: 40, displayThreshold: 0.5 },
+            summary: {
+              matchCount: 0,
+              byBand: { confirmed: 0, probable: 0, possible: 0, unlikely: 0 },
+              highestBand: null,
+              verdict: "no_matches_found",
+            },
+            matches: [],
+            relatedButUnverified: [],
+            coverage: {
+              exhaustive: true,
+              exhaustiveWithinFilters: true,
+              planClamped: false,
+              anyStrategyErrored: false,
+              strategiesRun: ["exact", "fuzzy"],
+              someRecordsWithheld: false,
+            },
+            adjudicationsRun: 0,
+            notice: "Results are public court records.",
+          },
+          meta: { creditsCharged: 20, adjudicated: false, corpusAsOf: "2026-09-17" },
+        },
+      },
+    ]);
+
+    const result = await client.screenParty({ name: "A Very Uncommon Name", entityType: "person", purpose: "kyc" });
+    expect(result.data.summary.verdict).toBe("no_matches_found");
+    expect(result.meta?.creditsCharged).toBe(20);
+  });
+});
+
+describe("14. coverage", () => {
+  it("unwraps the coverage snapshot without requiring auth to be present", async () => {
+    const { fetch, calls } = queueFetch([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            generatedAt: "2026-09-18T00:00:00.000Z",
+            index: "courtmesh_cases_v3",
+            total: 315_600_000,
+            documentBearing: 12_000_000,
+            statusOnly: 303_600_000,
+            byCourtType: [{ courtType: "High Court", records: 40_000_000, documentBearing: 8_000_000, latestDecisionDate: "2026-09-17" }],
+            byYear: [{ year: 2026, records: 1_200_000 }],
+            courts: [
+              {
+                court: "Delhi High Court",
+                courtType: "High Court",
+                records: 2_000_000,
+                documentBearing: 500_000,
+                earliestDecisionDate: "1950-01-01",
+                latestDecisionDate: "2026-09-17",
+                businessDaysBehind: 1,
+              },
+            ],
+            districtCourts: { records: 300_000_000, documentBearing: 1_000_000, latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
+          },
+          meta: { generatedAt: "2026-09-18T00:00:00.000Z", cacheTtlSeconds: 21600, corpusNote: "Counted 2026-09-18." },
+        },
+      },
+    ]);
+    const client = new CourtMeshClient({ fetch, maxRetries: 1 });
+
+    const result = await client.coverage();
+
+    expect(result.data.total).toBe(315_600_000);
+    expect(result.data.districtCourts.records).toBe(300_000_000);
+    expect(result.meta?.cacheTtlSeconds).toBe(21600);
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[0]?.url).toContain("/coverage");
+    expect(calls[0]?.headers.authorization).toBeUndefined();
+  });
+
+  it("sends the API key when the client is configured with one", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            generatedAt: "2026-09-18T00:00:00.000Z",
+            index: "courtmesh_cases_v3",
+            total: 1,
+            documentBearing: 1,
+            statusOnly: 0,
+            byCourtType: [],
+            byYear: [],
+            courts: [],
+            districtCourts: { records: 0, documentBearing: 0 },
+          },
+          meta: { generatedAt: "2026-09-18T00:00:00.000Z", cacheTtlSeconds: 21600 },
+        },
+      },
+    ]);
+    await client.coverage();
+    expect(calls[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
   });
 });

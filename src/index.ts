@@ -1,22 +1,27 @@
 export { CourtMeshClient } from "./client.js";
-export type { CourtMeshClientOptions, FetchLike } from "./client.js";
+export type { CourtMeshClientOptions, FetchLike, RequestConfig } from "./client.js";
 
 export {
+  API_REFUSAL_CODES,
   CourtMeshError,
   ValidationError,
   AuthenticationError,
   PermissionError,
+  InsufficientCreditsError,
   NotFoundError,
   RequestTimeoutError,
   RateLimitError,
   ServerError,
   BadGatewayError,
   ServiceUnavailableError,
+  PayloadTooLargeError,
   NetworkError,
   isCourtMeshError,
+  isRetryable429Code,
   mapStatusToError,
+  extractRequestId,
 } from "./errors.js";
-export type { CourtMeshErrorCode } from "./errors.js";
+export type { ApiRefusalCode, CourtMeshErrorCode, CourtMeshErrorExtra } from "./errors.js";
 
 export type {
   StringOrArray,
@@ -63,9 +68,35 @@ export type {
   AnalyzeConsolidatedMeta,
   TimelineJobStatus,
   OrderDocument,
+  RequestTimelineOptions,
   RequestTimelineResult,
   RequestTimelineMeta,
   TimelineJob,
   GetTimelineMeta,
   HealthResponse,
+  PartyEntityType,
+  PartyScreenPurpose,
+  PartyScreenIdentifiers,
+  PartyScreenAddress,
+  PartyScreenOptions,
+  PartyRole,
+  PartyScreenBand,
+  PartyScreenVerdict,
+  PartyScreenConfidence,
+  PartyScreenSignal,
+  PartyScreenEvidence,
+  PartyScreenMatch,
+  PartyScreenRelatedMatch,
+  PartyScreenByBand,
+  PartyScreenSummary,
+  PartyScreenCoverage,
+  PartyScreenQueryEcho,
+  PartyScreenResult,
+  PartyScreenMeta,
+  CoverageByCourtType,
+  CoverageByYear,
+  CoverageCourt,
+  CoverageDistrictCourts,
+  CoverageData,
+  CoverageMeta,
 } from "./types.js";
