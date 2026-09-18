@@ -7,6 +7,66 @@ Each entry also states which server flags/behaviour the version targets on
 the CourtMesh research server, since some of this SDK's contract only takes
 effect once a given server flag is on for your account.
 
+## [0.4.1]
+
+Live QA pass against the redeployed production research server
+(`research.courtmesh.ai`, 2026-09-19) and its updated OpenAPI spec. All items
+below were confirmed with live calls against an Enterprise key, not only
+against the spec.
+
+### Added
+
+- `User-Agent: courtmesh-node/0.4.1` sent on every request.
+- `UsageTierLimits.published`: this tier's number in the OpenAPI rate-limit
+  table, distinct from `requestsPerMinute` (the number actually enforced
+  right now) until the API self-serve tiers flag is on for your account, at
+  which point the two converge.
+- `CoverageMeta.snapshotAgeSeconds`, `.cacheAgeSeconds` and `.stale`,
+  replacing a single `ageSeconds` field that never actually existed on the
+  wire.
+- `CoverageCourt.courtType`, now explicitly nullable (added to the live
+  schema 2026-09-19).
+- `HealthCheckEntry`, `HealthCheckResult`, `PartyScreenRedactedName` and
+  `PartyScreenRedactedAliases` (carried forward from the interim QA branch,
+  re-verified live, see Changed below).
+
+### Changed
+
+- **Breaking:** `AuditHit.userAgent` removed - the redeployed server no
+  longer sends it at all (dropped for privacy alongside raw `ipAddress`,
+  which never appeared on the wire in the first place). `AuditHit.ipHash`
+  (a SHA-256 digest of the caller's IP) is retained; a same-day interim fix
+  had renamed `ipAddress` to `ipHash`, which remains correct.
+- **Breaking:** `UsageTierLimits`: every field but `requestsPerMinute` (and
+  now `published`) is nullable, matching a live Enterprise-key response with
+  the self-serve tiers flag off. `limits` itself is confirmed always a
+  populated object, never `null`.
+- **Breaking:** `CoverageMeta.corpusNote` is now required (the server always
+  sends it). `CoverageCourt`/`CoverageByCourtType`/`CoverageDistrictCourts`
+  date and `businessDaysBehind` fields are now nullable, not only optional,
+  matching the live schema.
+- `AuditHit.metadata` is now `Record<string, unknown> | null` - observed
+  `null` in production for hits with nothing to log, not only omitted.
+- `HealthResponse.checks` entries are bare status strings in production
+  (`"ok" | "fail" | "skipped"`), not `{ status, latencyMs?, error? }`
+  objects; `HealthCheckEntry` accepts either shape (interim fix, re-verified
+  live).
+- `PartyScreenQueryEcho.name`/`.aliases` are redacted to
+  `{ redacted: true, length }`/`{ redacted: true, count }` on a replayed
+  idempotent `party/screen` response instead of echoing the original
+  string/array (interim fix, re-verified live via a same-key replay).
+- Confirmed unchanged and correct: `caseNumber` is `string` (never a number)
+  on every endpoint that returns one; the five idempotency-key-aware POST
+  endpoints (`screenParty`, `screenPartyBatch`, `analyzeCase`,
+  `analyzeConsolidated`, `requestTimeline`) still send `Idempotency-Key` and
+  mark a replay; the per-endpoint default timeouts (`semanticSearch` 630s,
+  `requestTimeline` 240s, `analyzeConsolidated` 300s, `screenParty`/
+  `screenPartyBatch` 90s) are unchanged.
+
+### Removed
+
+- `AuditHit.userAgent` (see Changed above).
+
 ## [0.4.0]
 
 Targets the research server's account-introspection endpoints

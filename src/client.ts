@@ -59,7 +59,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.4.0";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.4.1";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 

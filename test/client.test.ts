@@ -644,7 +644,14 @@ describe("14. coverage", () => {
             ],
             districtCourts: { records: 300_000_000, documentBearing: 1_000_000, latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
           },
-          meta: { generatedAt: "2026-09-18T00:00:00.000Z", cacheTtlSeconds: 21600, corpusNote: "Counted 2026-09-18." },
+          meta: {
+            generatedAt: "2026-09-18T00:00:00.000Z",
+            cacheTtlSeconds: 21600,
+            snapshotAgeSeconds: 2145,
+            cacheAgeSeconds: 712,
+            stale: false,
+            corpusNote: "Counted 2026-09-18.",
+          },
         },
       },
     ]);
@@ -655,6 +662,9 @@ describe("14. coverage", () => {
     expect(result.data.total).toBe(315_600_000);
     expect(result.data.districtCourts.records).toBe(300_000_000);
     expect(result.meta?.cacheTtlSeconds).toBe(21600);
+    expect(result.meta?.snapshotAgeSeconds).toBe(2145);
+    expect(result.meta?.cacheAgeSeconds).toBe(712);
+    expect(result.meta?.stale).toBe(false);
     expect(calls[0]?.method).toBe("GET");
     expect(calls[0]?.url).toContain("/coverage");
     expect(calls[0]?.headers.authorization).toBeUndefined();
@@ -677,7 +687,14 @@ describe("14. coverage", () => {
             courts: [],
             districtCourts: { records: 0, documentBearing: 0 },
           },
-          meta: { generatedAt: "2026-09-18T00:00:00.000Z", cacheTtlSeconds: 21600 },
+          meta: {
+            generatedAt: "2026-09-18T00:00:00.000Z",
+            cacheTtlSeconds: 21600,
+            snapshotAgeSeconds: 0,
+            cacheAgeSeconds: 0,
+            stale: false,
+            corpusNote: "Counted 2026-09-18.",
+          },
         },
       },
     ]);
@@ -697,7 +714,7 @@ describe("15. usage", () => {
             tier: "payg",
             walletOwner: { type: "user", id: "u1" },
             balance: { total: 5000, monthlyGrant: 0, signupGrant: 1000, purchased: 4000 },
-            limits: { requestsPerMinute: 60, requestsPerDay: 5000, requestsPerMonth: 100000, maxPageSize: 50, maxPaginationDepth: 500, distinctCaseFetchesPerDay: 200, pdfCallsPerMonth: 200, aiCallsPerMonth: 100, concurrentAnalyzeJobs: 2, apiKeys: 5, semanticSearchAllowed: true, liveFetchAllowed: true, liveFetchesPerDay: 20, analysisReadAllowed: true, partyScreensPerMonth: 100 },
+            limits: { requestsPerMinute: 60, requestsPerDay: 5000, requestsPerMonth: 100000, maxPageSize: 50, maxPaginationDepth: 500, distinctCaseFetchesPerDay: 200, pdfCallsPerMonth: 200, aiCallsPerMonth: 100, concurrentAnalyzeJobs: 2, apiKeys: 5, semanticSearchAllowed: true, liveFetchAllowed: true, liveFetchesPerDay: 20, analysisReadAllowed: true, partyScreensPerMonth: 100, published: 60 },
             period: { start: "2026-09-01T00:00:00.000Z", end: "2026-09-30T18:29:59.999Z", key: "2026-09" },
             creditsUsedThisPeriod: 340,
             byEndpoint: [{ endpoint: "/api/v1/prod/search/cases", calls: 12, credits: 12 }],
@@ -718,10 +735,12 @@ describe("15. usage", () => {
     expect(calls[0]?.url).toContain("/usage");
   });
 
-  it("accepts the live shape: an Enterprise key's uncapped limits are null, and meta.selfServe", async () => {
-    // Live-verified 2026-09-19: every UsageTierLimits field but
-    // requestsPerMinute came back null (not -1, not true/false) for an
-    // Enterprise key, and meta carried an undocumented selfServe flag.
+  it("accepts the live shape: an Enterprise key's uncapped limits are null, plus published, and meta.selfServe", async () => {
+    // Live-verified 2026-09-19 against the redeployed server: `limits` is
+    // always a populated object (never null itself). Every field but
+    // requestsPerMinute and the new `published` came back null (not -1, not
+    // true/false) for an Enterprise key with the self-serve tiers flag off,
+    // and meta carried an undocumented selfServe flag.
     const { client } = makeClient([
       {
         status: 200,
@@ -747,6 +766,7 @@ describe("15. usage", () => {
               liveFetchesPerDay: null,
               analysisReadAllowed: null,
               partyScreensPerMonth: null,
+              published: 600,
             },
             period: { start: "2026-08-31T18:30:00.000Z", end: "2026-09-30T18:29:59.999Z", key: "2026-09" },
             creditsUsedThisPeriod: 0,
@@ -763,6 +783,7 @@ describe("15. usage", () => {
     expect(result.data.limits.requestsPerMinute).toBe(10);
     expect(result.data.limits.requestsPerDay).toBeNull();
     expect(result.data.limits.semanticSearchAllowed).toBeNull();
+    expect(result.data.limits.published).toBe(600);
     expect(result.meta?.selfServe).toBe(false);
   });
 });
@@ -865,10 +886,12 @@ describe("18. audit", () => {
     expect(calls[0]?.url).toContain("limit=50");
   });
 
-  it("accepts the live shape: hits carry ipHash, never ipAddress", async () => {
-    // Live-verified 2026-09-19: every hit's IP field on the wire is
-    // ipHash (a SHA-256 hex digest), not ipAddress - this SDK's AuditHit
-    // type documented a field that has never actually appeared.
+  it("accepts the live shape: hits carry ipHash, never ipAddress or userAgent", async () => {
+    // Live-verified 2026-09-19 against the redeployed server and its
+    // updated OpenAPI spec: every hit's IP field on the wire is ipHash (a
+    // SHA-256 hex digest), never raw ipAddress; userAgent is no longer sent
+    // at all as of this deploy (dropped for privacy alongside ipAddress).
+    // metadata can also be sent as an explicit null, not only omitted.
     const { client } = makeClient([
       {
         status: 200,
@@ -883,8 +906,8 @@ describe("18. audit", () => {
                 statusCode: 200,
                 responseTime: 2,
                 createdAt: "2026-09-18T00:00:00.000Z",
+                metadata: null,
                 ipHash: "4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f",
-                userAgent: "courtmesh-node/0.4.0",
               },
             ],
             summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 2, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 0 },
@@ -898,7 +921,8 @@ describe("18. audit", () => {
     const result = await client.audit();
 
     expect(result.data.hits[0]?.ipHash).toBe("4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f");
-    expect(result.data.hits[0]?.userAgent).toBe("courtmesh-node/0.4.0");
+    expect(result.data.hits[0]?.metadata).toBeNull();
+    expect("userAgent" in (result.data.hits[0] ?? {})).toBe(false);
   });
 });
 

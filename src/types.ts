@@ -945,7 +945,7 @@ export interface CoverageByCourtType {
   courtType: string;
   records: number;
   documentBearing: number;
-  latestDecisionDate?: string;
+  latestDecisionDate?: string | null;
 }
 
 export interface CoverageByYear {
@@ -955,23 +955,32 @@ export interface CoverageByYear {
 
 export interface CoverageCourt {
   court: string;
-  courtType: string;
+  /** Nullable as of 2026-09-19 (live-verified: still populated for every observed row, but the spec now allows `null`). */
+  courtType: string | null;
   records: number;
   documentBearing: number;
-  earliestDecisionDate?: string;
-  latestDecisionDate?: string;
-  /** How many business days behind live filings this court's index appears to be. */
-  businessDaysBehind?: number;
+  earliestDecisionDate?: string | null;
+  latestDecisionDate?: string | null;
+  /** How many business days behind live filings this court's index appears to be. Null when it cannot be computed. */
+  businessDaysBehind?: number | null;
 }
 
 /** District Courts are reported as a single rolled up row, the index has no per-state field. */
 export interface CoverageDistrictCourts {
   records: number;
   documentBearing: number;
-  latestDecisionDate?: string;
-  businessDaysBehind?: number;
+  latestDecisionDate?: string | null;
+  businessDaysBehind?: number | null;
 }
 
+/**
+ * Only these fields are ever returned - the server's `sanitizeCoverageResponse`
+ * strips every other field the raw OpenSearch coverage response carries
+ * (operational bookkeeping such as `byYearMissing`, `sumOtherDocCount`,
+ * `docCountErrorUpperBound`, an upstream `ageSeconds`, and the refresh job's
+ * own job status) before this is ever cached or served - confirmed against
+ * the redeployed OpenAPI spec and a live call 2026-09-19.
+ */
 export interface CoverageData {
   generatedAt: string;
   /** The OpenSearch index this snapshot was counted from, for example `"courtmesh_cases_v3"`. */
@@ -985,11 +994,22 @@ export interface CoverageData {
   districtCourts: CoverageDistrictCourts;
 }
 
+/**
+ * Live-verified 2026-09-19: `meta.ageSeconds` from earlier documentation does
+ * not exist on the wire; the server sends two distinct ages instead, both
+ * always present.
+ */
 export interface CoverageMeta {
   generatedAt: string;
   /** How long this response may be served from cache, currently 21600 (6 hours). */
   cacheTtlSeconds: number;
-  corpusNote?: string;
+  /** How old the underlying data snapshot itself is - seconds since `data.generatedAt` - independent of when this service happened to fetch it. */
+  snapshotAgeSeconds: number;
+  /** How long ago this service fetched and cached the snapshot. `stale` is judged against this one, not `snapshotAgeSeconds`. */
+  cacheAgeSeconds: number;
+  /** True once `cacheAgeSeconds` reaches `cacheTtlSeconds` - only possible when a refresh failed or was unusually delayed. */
+  stale: boolean;
+  corpusNote: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1014,13 +1034,19 @@ export interface UsageBalance {
  * Mirrors the server's `TierLimits` (server/config/api-tiers.ts). `-1` means
  * unlimited on any per period field for a tier that has a numbered cap.
  *
- * Live-verified 2026-09-19 on an Enterprise key: every field below other
- * than `requestsPerMinute` came back `null`, not `-1` and not `true`/`false`
- * - this tier apparently has no configured cap at all for those fields
- * rather than an explicit "unlimited" sentinel. Every field except
- * `requestsPerMinute` is typed nullable to match; treat `null` the same as
- * `-1`/unlimited (or "allowed") unless you have evidence a given tier
- * distinguishes the two.
+ * `limits` itself is always a populated object (verified live and in the
+ * redeployed OpenAPI spec, `data.limits` is `required` and never `null`).
+ * Live-verified 2026-09-19 on an Enterprise key with the API self-serve
+ * tiers flag off: `requestsPerMinute` is 10, the flat legacy ceiling
+ * actually enforced right now (matches `X-RateLimit-Limit`); `published` is
+ * this tier's documented number (600 for enterprise) from the "Rate limits
+ * and per-IP limits" table, whether or not it is the one enforced yet; and
+ * every other field came back `null`, not `-1` and not `true`/`false` - this
+ * tier apparently has no configured cap at all for those fields with the
+ * flag off. `requestsPerMinute` and `published` converge once self serve
+ * tiers are enabled. Every field except `requestsPerMinute` and `published`
+ * is typed nullable to match; treat `null` the same as `-1`/unlimited (or
+ * "allowed") unless you have evidence a given tier distinguishes the two.
  */
 export interface UsageTierLimits {
   requestsPerMinute: number;
@@ -1038,6 +1064,8 @@ export interface UsageTierLimits {
   liveFetchesPerDay: number | null;
   analysisReadAllowed: boolean | null;
   partyScreensPerMonth: number | null;
+  /** This tier's number in the OpenAPI rate-limit table, whether or not it is the one `requestsPerMinute` currently enforces. Added 2026-09-19. */
+  published: number;
 }
 
 /** The [start, end] ISO timestamps of the Asia/Kolkata calendar month this usage was aggregated over. */
@@ -1113,14 +1141,17 @@ export interface AuditHit {
   responseTime: number;
   isAiAnalysis?: boolean;
   creditsDeducted?: number;
-  metadata?: Record<string, unknown>;
+  /** Observed `null` in production for hits with nothing to log (for example a plain `GET /me`), not only omitted. */
+  metadata?: Record<string, unknown> | null;
   /**
-   * Live-verified 2026-09-19: the server sends `ipHash` (a SHA-256 hex
-   * digest of the caller's IP), never `ipAddress` - the field this SDK
-   * documented until now does not appear on the wire at all.
+   * Live-verified 2026-09-19 against the redeployed server and its updated
+   * OpenAPI spec: `ipHash` (a SHA-256 hex digest of the caller's IP) is
+   * still sent, and remains the only IP-shaped field - raw `ipAddress` does
+   * not exist on the wire. `userAgent`, however, is no longer sent at all as
+   * of this deploy (dropped for privacy alongside raw `ipAddress`, per the
+   * endpoint's updated description); this SDK's field for it is removed.
    */
   ipHash?: string;
-  userAgent?: string;
   createdAt: string;
 }
 
