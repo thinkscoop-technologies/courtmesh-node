@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CourtMeshClient } from "../src/client.js";
 import { CourtMeshError } from "../src/errors.js";
 import { queueFetch } from "./helpers.js";
@@ -1065,5 +1065,110 @@ describe("X-Request-Id backfill", () => {
     ]);
     const result = await client.me();
     expect(result.requestId).toBe("body-req-1");
+  });
+});
+
+describe("R4: per endpoint default timeouts", () => {
+  // No unit test previously pinned these constants down (unlike the python
+  // SDK's test_per_endpoint_default_timeouts_are_applied); spy on the
+  // global setTimeout the client uses to schedule its AbortController and
+  // assert the delay it was given, without ever waiting for it to fire.
+  function makeClientWithSetTimeoutSpy(entries: Parameters<typeof queueFetch>[0]) {
+    const { fetch } = queueFetch(entries);
+    const delays: number[] = [];
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? -1);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const client = new CourtMeshClient({ apiKey: API_KEY, fetch });
+    return { client, delays, spy };
+  }
+
+  it("semanticSearch defaults to 630000ms", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([
+      { status: 200, body: { success: true, data: [], meta: { query: "x", responseTime: "1ms" }, pagination: { page: 1, limit: 20, total: 0, totalPages: 0, hasMore: false } } },
+    ]);
+    await client.semanticSearch({ query: "right to privacy" });
+    expect(delays).toContain(630_000);
+    spy.mockRestore();
+  });
+
+  it("requestTimeline defaults to 240000ms", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([
+      { status: 200, body: { success: true, data: { requestId: "r1", status: "pending" }, meta: { liveFetch: false, responseTime: "1ms" } } },
+    ]);
+    await client.requestTimeline("case1");
+    expect(delays).toContain(240_000);
+    spy.mockRestore();
+  });
+
+  it("analyzeConsolidated defaults to 300000ms", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([
+      { status: 200, body: { success: true, data: { status: "success", consolidatedAnalysis: {} }, meta: { responseTime: "1ms" } } },
+    ]);
+    await client.analyzeConsolidated("case1");
+    expect(delays).toContain(300_000);
+    spy.mockRestore();
+  });
+
+  it("screenParty and screenPartyBatch default to 90000ms", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            query: { name: "x", aliases: [], entityType: "person", purpose: "kyc", limit: 40, displayThreshold: 0.5 },
+            summary: { matchCount: 0, byBand: { confirmed: 0, probable: 0, possible: 0, unlikely: 0 }, highestBand: null, verdict: "no_matches_found" },
+            matches: [],
+            relatedButUnverified: [],
+            coverage: { exhaustive: true, exhaustiveWithinFilters: true, planClamped: false, anyStrategyErrored: false, strategiesRun: [], someRecordsWithheld: false },
+            adjudicationsRun: 0,
+            notice: "",
+          },
+          meta: { creditsCharged: 20, adjudicated: false, corpusAsOf: "2026-09-17" },
+        },
+      },
+    ]);
+    await client.screenParty({ name: "x", entityType: "person", purpose: "kyc" });
+    expect(delays).toContain(90_000);
+    spy.mockRestore();
+  });
+
+  it("every other endpoint defaults to 30000ms", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([{ status: 200, body: { success: true, data: ["A"] } }]);
+    await client.searchJudges({ q: "a" });
+    expect(delays).toContain(30_000);
+    spy.mockRestore();
+  });
+
+  it("a per call timeoutMs override wins over the endpoint default", async () => {
+    const { client, delays, spy } = makeClientWithSetTimeoutSpy([
+      { status: 200, body: { success: true, data: [], meta: { query: "x", responseTime: "1ms" }, pagination: { page: 1, limit: 20, total: 0, totalPages: 0, hasMore: false } } },
+    ]);
+    await client.semanticSearch({ query: "right to privacy" }, { timeoutMs: 5_000 });
+    expect(delays).toContain(5_000);
+    expect(delays).not.toContain(630_000);
+    spy.mockRestore();
+  });
+
+  it("live-verified: a very short timeoutMs actually aborts the request and throws RequestTimeoutError", async () => {
+    // Not mocked: a fetch impl that only settles when its AbortSignal
+    // fires (exactly like undici's real fetch), proving the
+    // AbortController + setTimeout wiring genuinely fires end to end
+    // rather than only being observed via a setTimeout spy.
+    const hangingFetch = (_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const error = new Error("This operation was aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      });
+    const client = new CourtMeshClient({ apiKey: API_KEY, fetch: hangingFetch, maxRetries: 0 });
+    const error = await client.coverage({ timeoutMs: 20 }).catch((e) => e);
+    expect(error).toBeInstanceOf(CourtMeshError);
+    expect((error as CourtMeshError).code).toBe("request_timeout");
+    expect((error as CourtMeshError).statusCode).toBe(408);
   });
 });
