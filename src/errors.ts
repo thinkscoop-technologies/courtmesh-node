@@ -11,6 +11,7 @@ export type CourtMeshErrorCode =
   | "authentication_error"
   | "permission_error"
   | "not_found"
+  | "conflict"
   | "request_timeout"
   | "insufficient_credits"
   | "rate_limit"
@@ -72,7 +73,10 @@ export type ApiRefusalCode =
   | "IP_NOT_ALLOWED"
   | "VALIDATION_ERROR"
   | "MALFORMED_JSON"
-  | "PAYLOAD_TOO_LARGE";
+  | "PAYLOAD_TOO_LARGE"
+  | "IDEMPOTENCY_KEY_REUSED"
+  | "IDEMPOTENCY_IN_PROGRESS"
+  | "IDEMPOTENCY_KEY_INVALID";
 
 /**
  * Runtime mirror of `API_REFUSAL_CODES` (server/config/api-tiers.ts) plus the
@@ -120,6 +124,9 @@ export const API_REFUSAL_CODES = {
   VALIDATION_ERROR: "VALIDATION_ERROR",
   MALFORMED_JSON: "MALFORMED_JSON",
   PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
+  IDEMPOTENCY_KEY_REUSED: "IDEMPOTENCY_KEY_REUSED",
+  IDEMPOTENCY_IN_PROGRESS: "IDEMPOTENCY_IN_PROGRESS",
+  IDEMPOTENCY_KEY_INVALID: "IDEMPOTENCY_KEY_INVALID",
 } as const satisfies Record<string, ApiRefusalCode>;
 
 const DAILY_CAP_429_CODES: ReadonlySet<string> = new Set([
@@ -281,6 +288,23 @@ export class NotFoundError extends CourtMeshError {
   constructor(message: string, body: unknown, extra: CourtMeshErrorExtra = {}) {
     super(message, "not_found", 404, body, extra);
     this.name = "NotFoundError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * 409, an `Idempotency-Key` conflict: `apiCode === "IDEMPOTENCY_KEY_REUSED"`
+ * when the same key was sent with a different request body than the one it
+ * was first used with, or `apiCode === "IDEMPOTENCY_IN_PROGRESS"` when a
+ * request with this same key is still being processed concurrently (retry
+ * shortly). Only ever thrown by `screenParty`, `screenPartyBatch`,
+ * `analyzeCase`, `analyzeConsolidated` and `requestTimeline`, the five
+ * endpoints that accept an `Idempotency-Key`.
+ */
+export class ConflictError extends CourtMeshError {
+  constructor(message: string, body: unknown, extra: CourtMeshErrorExtra = {}) {
+    super(message, "conflict", 409, body, extra);
+    this.name = "ConflictError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
@@ -543,6 +567,8 @@ export function mapStatusToError(
     }
     case 404:
       return new NotFoundError(message, body, extra);
+    case 409:
+      return new ConflictError(message, body, extra);
     case 408:
       return new RequestTimeoutError(message, body, extra);
     case 413:

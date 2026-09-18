@@ -4,6 +4,7 @@ import {
   API_REFUSAL_CODES,
   AuthenticationError,
   BadGatewayError,
+  ConflictError,
   InsufficientCreditsError,
   NotFoundError,
   PayloadTooLargeError,
@@ -108,6 +109,40 @@ describe("error class mapping", () => {
     const error = await client.getCase("missing").catch((e) => e);
     expect(error).toBeInstanceOf(NotFoundError);
     expect(error.statusCode).toBe(404);
+  });
+
+  it("409 -> ConflictError with apiCode IDEMPOTENCY_KEY_REUSED", async () => {
+    const { client } = makeClient([
+      {
+        status: 409,
+        body: {
+          success: false,
+          error: "This Idempotency-Key was already used with a different request body.",
+          code: "IDEMPOTENCY_KEY_REUSED",
+        },
+      },
+    ]);
+    const error = await client.analyzeCase("1", {}, { idempotencyKey: "dup-1" }).catch((e) => e);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect(error.statusCode).toBe(409);
+    expect(error.apiCode).toBe(API_REFUSAL_CODES.IDEMPOTENCY_KEY_REUSED);
+    expect(error.code).toBe("conflict");
+  });
+
+  it("409 -> ConflictError with apiCode IDEMPOTENCY_IN_PROGRESS", async () => {
+    const { client } = makeClient([
+      {
+        status: 409,
+        body: {
+          success: false,
+          error: "A request with this Idempotency-Key is still being processed.",
+          code: "IDEMPOTENCY_IN_PROGRESS",
+        },
+      },
+    ]);
+    const error = await client.requestTimeline("1", {}, { idempotencyKey: "in-flight-1" }).catch((e) => e);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect(error.apiCode).toBe(API_REFUSAL_CODES.IDEMPOTENCY_IN_PROGRESS);
   });
 
   it("408 -> RequestTimeoutError", async () => {

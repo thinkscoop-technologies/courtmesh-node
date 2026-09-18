@@ -622,3 +622,278 @@ describe("14. coverage", () => {
     expect(calls[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
   });
 });
+
+describe("15. usage", () => {
+  it("unwraps tier, balance, limits and per endpoint usage", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            tier: "payg",
+            walletOwner: { type: "user", id: "u1" },
+            balance: { total: 5000, monthlyGrant: 0, signupGrant: 1000, purchased: 4000 },
+            limits: { requestsPerMinute: 60, requestsPerDay: 5000, requestsPerMonth: 100000, maxPageSize: 50, maxPaginationDepth: 500, distinctCaseFetchesPerDay: 200, pdfCallsPerMonth: 200, aiCallsPerMonth: 100, concurrentAnalyzeJobs: 2, apiKeys: 5, semanticSearchAllowed: true, liveFetchAllowed: true, liveFetchesPerDay: 20, analysisReadAllowed: true, partyScreensPerMonth: 100 },
+            period: { start: "2026-09-01T00:00:00.000Z", end: "2026-09-30T18:29:59.999Z", key: "2026-09" },
+            creditsUsedThisPeriod: 340,
+            byEndpoint: [{ endpoint: "/api/v1/prod/search/cases", calls: 12, credits: 12 }],
+            subscriptionRenewsAt: null,
+          },
+          meta: { requestId: "req-usage-1" },
+        },
+      },
+    ]);
+
+    const result = await client.usage();
+
+    expect(result.data.tier).toBe("payg");
+    expect(result.data.balance.total).toBe(5000);
+    expect(result.data.byEndpoint[0]?.calls).toBe(12);
+    expect(result.meta?.requestId).toBe("req-usage-1");
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[0]?.url).toContain("/usage");
+  });
+});
+
+describe("16. health(deep)", () => {
+  it("plain form sends no query and is not enveloped in data", async () => {
+    const { client, calls } = makeClient([
+      { status: 200, body: { success: true, status: "healthy", version: "1.0.0", commit: "abc123", timestamp: "2026-09-18T00:00:00.000Z" } },
+    ]);
+    const result = await client.health();
+    expect(result.status).toBe("healthy");
+    expect(result.checks).toBeUndefined();
+    expect(calls[0]?.url).not.toContain("deep");
+    expect(calls[0]?.headers.authorization).toBeUndefined();
+  });
+
+  it("deep form sends ?deep=1 and surfaces checks", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          status: "degraded",
+          version: "1.0.0",
+          commit: "abc123",
+          checks: { mongo: { status: "ok", latencyMs: 12 }, opensearch: { status: "degraded", latencyMs: 900 } },
+          timestamp: "2026-09-18T00:00:00.000Z",
+        },
+      },
+    ]);
+    const result = await client.health({ deep: true });
+    expect(result.status).toBe("degraded");
+    expect(result.checks?.opensearch?.status).toBe("degraded");
+    expect(calls[0]?.url).toContain("deep=1");
+  });
+});
+
+describe("17. me", () => {
+  it("unwraps the account identity", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: { success: true, data: { userId: "u1", email: "a@b.com", name: "A B", role: "ORG_ADMIN", organizationId: "org1" } },
+      },
+    ]);
+    const result = await client.me();
+    expect(result.data.userId).toBe("u1");
+    expect(result.data.organizationId).toBe("org1");
+    expect(calls[0]?.url).toContain("/me");
+    expect(calls[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
+  });
+});
+
+describe("18. audit", () => {
+  it("sends query params and unwraps hits, summary and pagination", async () => {
+    const { client, calls } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            hits: [{ id: "h1", endpoint: "/api/v1/prod/search/cases", method: "POST", statusCode: 200, responseTime: 120, createdAt: "2026-09-18T00:00:00.000Z" }],
+            summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 120, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 1 },
+            topEndpoints: [{ endpoint: "/api/v1/prod/search/cases", count: 1 }],
+          },
+          pagination: { total: 1, limit: 50, offset: 0, hasMore: false },
+        },
+      },
+    ]);
+
+    const result = await client.audit({ userId: "u1", limit: 50, offset: 0 });
+
+    expect(result.data.hits).toHaveLength(1);
+    expect(result.data.summary.successRate).toBe("100.0");
+    expect(result.pagination.total).toBe(1);
+    expect(calls[0]?.url).toContain("userId=u1");
+    expect(calls[0]?.url).toContain("limit=50");
+  });
+});
+
+describe("19. referenceCourts", () => {
+  it("unwraps the court hierarchy without requiring auth", async () => {
+    const { fetch, calls } = queueFetch([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            courtTypes: ["Supreme Court", "High Court", "District Court", "Tribunal"],
+            courtsByType: { "High Court": ["Delhi High Court"] },
+            courtNamesByCourt: { "Delhi High Court": ["High Court of Delhi"] },
+          },
+        },
+      },
+    ]);
+    const client = new CourtMeshClient({ fetch, maxRetries: 1 });
+
+    const result = await client.referenceCourts();
+
+    expect(result.data.courtTypes).toContain("High Court");
+    expect(result.data.courtsByType["High Court"]).toContain("Delhi High Court");
+    expect(calls[0]?.headers.authorization).toBeUndefined();
+  });
+});
+
+describe("20. referenceCaseTypes", () => {
+  it("unwraps the flattened case type list", async () => {
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: {
+          success: true,
+          data: [{ code: "CRL.A", fullForm: "Criminal Appeal", primaryType: "Criminal", nature: "Appellate" }],
+        },
+      },
+    ]);
+    const result = await client.referenceCaseTypes();
+    expect(result.data[0]?.code).toBe("CRL.A");
+  });
+});
+
+describe("21. screenPartyBatch", () => {
+  const batchBody = {
+    success: true,
+    data: {
+      results: [
+        {
+          clientRef: "row-1",
+          index: 0,
+          ok: true,
+          screen: {
+            query: { name: "Acme Textiles Pvt Ltd", aliases: [], entityType: "company", purpose: "due_diligence", limit: 40, displayThreshold: 0.5 },
+            summary: { matchCount: 0, byBand: { confirmed: 0, probable: 0, possible: 0, unlikely: 0 }, highestBand: null, verdict: "no_matches_found" },
+            matches: [],
+            relatedButUnverified: [],
+            coverage: { exhaustive: true, exhaustiveWithinFilters: true, planClamped: false, anyStrategyErrored: false, strategiesRun: ["exact"], someRecordsWithheld: false },
+            adjudicationsRun: 0,
+            notice: "Results are public court records.",
+          },
+        },
+        {
+          clientRef: "row-2",
+          index: 1,
+          ok: false,
+          error: { code: "VALIDATION_ERROR", message: "name must be 2..200 characters" },
+        },
+      ],
+      summary: { items: 2, matchesFound: 0, noMatches: 1, inconclusive: 0, errors: 1 },
+    },
+    meta: { creditsCharged: 20, requestId: "req-batch-1" },
+  };
+
+  it("sends items/purpose and unwraps per item ok/error results", async () => {
+    const { client, calls } = makeClient([{ status: 200, body: batchBody }]);
+
+    const result = await client.screenPartyBatch({
+      items: [
+        { clientRef: "row-1", name: "Acme Textiles Pvt Ltd", entityType: "company" },
+        { clientRef: "row-2", name: "A" },
+      ],
+      purpose: "due_diligence",
+    });
+
+    expect(result.data.summary.items).toBe(2);
+    expect(result.data.results[0]?.ok).toBe(true);
+    expect(result.data.results[1]?.ok).toBe(false);
+    if (result.data.results[1]?.ok === false) {
+      expect(result.data.results[1].error.code).toBe("VALIDATION_ERROR");
+    }
+    expect(result.meta?.creditsCharged).toBe(20);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toContain("/party/screen/batch");
+    expect(calls[0]?.body).toMatchObject({ purpose: "due_diligence" });
+  });
+});
+
+describe("Idempotency-Key", () => {
+  it("does not send an Idempotency-Key by default", async () => {
+    const { client, calls } = makeClient([{ status: 202, body: { success: true, data: { message: "Analysis has been started", status: "processing" }, meta: { responseTime: "10ms", note: "" } } }]);
+    await client.analyzeCase("case1");
+    expect(calls[0]?.headers["idempotency-key"]).toBeUndefined();
+  });
+
+  it("sends an explicit idempotencyKey verbatim", async () => {
+    const { client, calls } = makeClient([{ status: 202, body: { success: true, data: { message: "Analysis has been started", status: "processing" }, meta: { responseTime: "10ms", note: "" } } }]);
+    await client.analyzeCase("case1", {}, { idempotencyKey: "my-key-123" });
+    expect(calls[0]?.headers["idempotency-key"]).toBe("my-key-123");
+  });
+
+  it("auto-generates a UUID v4 Idempotency-Key when retryPosts is enabled and no key was given", async () => {
+    const { client, calls } = makeClient(
+      [{ status: 202, body: { success: true, data: { message: "Analysis has been started", status: "processing" }, meta: { responseTime: "10ms", note: "" } } }],
+      { retryPosts: true },
+    );
+    await client.analyzeCase("case1");
+    const key = calls[0]?.headers["idempotency-key"];
+    expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it("per-call retryPosts: true also triggers auto-generation for that one call", async () => {
+    const { client, calls } = makeClient([{ status: 200, body: { success: true, data: { requestId: "job1", status: "completed" }, meta: { liveFetch: false, responseTime: "5ms" } } }]);
+    await client.requestTimeline("case1", {}, { retryPosts: true });
+    expect(calls[0]?.headers["idempotency-key"]).toBeTruthy();
+  });
+
+  it("surfaces Idempotency-Replayed: true as response.replayed", async () => {
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: { success: true, data: { message: "Analysis has been started", status: "processing" }, meta: { responseTime: "10ms", note: "" } },
+        headers: { "Idempotency-Replayed": "true" },
+      },
+    ]);
+    const result = await client.analyzeCase("case1", {}, { idempotencyKey: "dup-1" });
+    expect(result.replayed).toBe(true);
+  });
+
+  it("does not set replayed when the header is absent", async () => {
+    const { client } = makeClient([{ status: 200, body: { success: true, status: "healthy", version: "1.0.0", timestamp: "2026-09-18T00:00:00.000Z" } }]);
+    const result = await client.health();
+    expect(result.requestId).toBeUndefined();
+  });
+});
+
+describe("X-Request-Id backfill", () => {
+  it("backfills response.requestId from the X-Request-Id header when the body has none", async () => {
+    const { client } = makeClient([
+      { status: 200, body: { success: true, status: "healthy", version: "1.0.0", timestamp: "2026-09-18T00:00:00.000Z" }, headers: { "X-Request-Id": "hdr-req-1" } },
+    ]);
+    const result = await client.health();
+    expect(result.requestId).toBe("hdr-req-1");
+  });
+
+  it("does not overwrite an already present body-level requestId", async () => {
+    const { client } = makeClient([
+      {
+        status: 200,
+        body: { success: true, data: { userId: "u1", name: null, role: null }, requestId: "body-req-1" },
+        headers: { "X-Request-Id": "hdr-req-2" },
+      },
+    ]);
+    const result = await client.me();
+    expect(result.requestId).toBe("body-req-1");
+  });
+});

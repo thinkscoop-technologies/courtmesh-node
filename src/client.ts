@@ -7,9 +7,13 @@ import type {
   AnalyzeConsolidatedOptions,
   AnalyzeConsolidatedResult,
   ApiResponse,
+  AuditOptions,
+  AuditResponse,
   CaseAnalysis,
   CaseDetails,
   CaseListItem,
+  CaseTypeEntry,
+  CourtHierarchy,
   CoverageData,
   CoverageMeta,
   GetCaseAnalysisMeta,
@@ -18,10 +22,16 @@ import type {
   GetTimelineMeta,
   HealthResponse,
   KeywordSearchPagination,
+  MeData,
+  PartyScreenBatchMeta,
+  PartyScreenBatchOptions,
+  PartyScreenBatchResult,
   PartyScreenMeta,
   PartyScreenOptions,
   PartyScreenResult,
   PdfResponse,
+  ReferenceCaseTypesResponse,
+  ReferenceCourtsResponse,
   RelatedMeta,
   RelatedResponse,
   RequestTimelineMeta,
@@ -38,6 +48,8 @@ import type {
   SemanticSearchPagination,
   SemanticSearchResponse,
   TimelineJob,
+  UsageData,
+  UsageMeta,
 } from "./types.js";
 
 /** A fetch compatible function, this is what the `fetch` option and the global `fetch` both satisfy. */
@@ -93,6 +105,25 @@ export interface RequestConfig {
   timeoutMs?: number;
   /** Overrides the client's `retryPosts` default for this one call. Meaningless on a GET. */
   retryPosts?: boolean;
+  /**
+   * Only meaningful on `screenParty`, `screenPartyBatch`, `analyzeCase`,
+   * `analyzeConsolidated` and `requestTimeline` - the five endpoints that
+   * accept an `Idempotency-Key` header. 1 to 128 characters,
+   * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
+   * the same key and the same body returns the stored 2xx response again
+   * (`response.replayed` is then `true`) with no new charge; the same key
+   * with a *different* body throws `ValidationError` with
+   * `apiCode === "IDEMPOTENCY_KEY_REUSED"`.
+   *
+   * When omitted, and `retryPosts` (this call's override, or the client's
+   * own default) is in effect for this call, the SDK generates a random
+   * UUID v4 for you, so an automatic retry of this exact call is always
+   * safe from a double charge or a double-run job. When `retryPosts` is
+   * not in effect either, no key is generated or sent - use it explicitly
+   * whenever you also intend to retry a call yourself (for example across
+   * separate process runs).
+   */
+  idempotencyKey?: string;
 }
 
 const DEFAULT_BASE_URL = "https://research.courtmesh.ai/api/v1/prod";
@@ -166,6 +197,30 @@ function extractApiCode(body: unknown): string | undefined {
   return isRecord(body) && typeof body.code === "string" ? body.code : undefined;
 }
 
+/**
+ * A random UUID v4, used to auto-generate an `Idempotency-Key` when a caller
+ * has opted into `retryPosts` but did not supply their own key (see
+ * `RequestConfig.idempotencyKey`). Prefers the standard `crypto.randomUUID`
+ * (available in Node 18+ and every modern browser); falls back to a manual
+ * RFC 4122 v4 implementation on a runtime without it.
+ */
+function generateIdempotencyKey(): string {
+  const globalCrypto = (globalThis as { crypto?: { randomUUID?: () => string; getRandomValues?: <T extends Uint8Array>(array: T) => T } }).crypto;
+  if (globalCrypto?.randomUUID) {
+    return globalCrypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (globalCrypto?.getRandomValues) {
+    globalCrypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+}
+
 interface RequestOptions {
   method: "GET" | "POST";
   path: string;
@@ -177,6 +232,8 @@ interface RequestOptions {
   timeoutMs?: number;
   /** Per call override of the client's `retryPosts` default. */
   retryPosts?: boolean;
+  /** Sent as the `Idempotency-Key` header when present. See `RequestConfig.idempotencyKey`. */
+  idempotencyKey?: string;
 }
 
 /**
@@ -448,6 +505,7 @@ export class CourtMeshClient {
       body: { force: options.force ?? false, ...(options.allowRemoteFetch ? { allowRemoteFetch: true } : {}) },
       timeoutMs: requestOptions.timeoutMs,
       retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 
@@ -466,6 +524,7 @@ export class CourtMeshClient {
       body: { force: options.force ?? false },
       timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.analyzeConsolidated,
       retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 
@@ -492,6 +551,7 @@ export class CourtMeshClient {
       body: { case_id: caseId, ...(options.refresh ? { refresh: true } : {}) },
       timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.requestTimeline,
       retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 
@@ -506,21 +566,6 @@ export class CourtMeshClient {
     return this.request<ApiResponse<TimelineJob, GetTimelineMeta>>({
       method: "GET",
       path: `/get-timeline/${encodeURIComponent(requestId)}`,
-      timeoutMs: requestOptions.timeoutMs,
-    });
-  }
-
-  /* ---------------------------------------------------------------------- */
-  /* 12. GET /health                                                       */
-  /* ---------------------------------------------------------------------- */
-
-  /** No auth required, not rate limited, not enveloped in `data`. */
-  async health(requestOptions: RequestConfig = {}): Promise<HealthResponse> {
-    return this.request<HealthResponse>({
-      method: "GET",
-      path: "/health",
-      query: undefined,
-      skipAuth: true,
       timeoutMs: requestOptions.timeoutMs,
     });
   }
@@ -553,6 +598,7 @@ export class CourtMeshClient {
       body: options,
       timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.screenParty,
       retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 
@@ -575,6 +621,154 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* 15. GET /usage                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Reports this API key's tier, wallet balance, per period limits and per
+   * endpoint call volume for the current Asia/Kolkata calendar month.
+   * Unmetered like every other account introspection call - checking your
+   * own usage never itself burns a credit.
+   */
+  async usage(requestOptions: RequestConfig = {}): Promise<ApiResponse<UsageData, UsageMeta>> {
+    return this.request<ApiResponse<UsageData, UsageMeta>>({
+      method: "GET",
+      path: "/usage",
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 16. GET /health?deep=1                                                */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Check API health. No auth required, not rate limited beyond the public
+   * health limiter.
+   *
+   * The plain form (`deep` omitted or false) is a cheap liveness probe: no
+   * dependency calls, always fast, always HTTP 200 while the process is up.
+   * Pass `deep: true` to also check Mongo, OpenSearch, Qdrant, Redis and IAM
+   * standing (each bounded to 1s) - `status` then also reports `"degraded"`,
+   * and HTTP 503 (`status: "unhealthy"`) when a hard dependency (Mongo or
+   * OpenSearch) is down. Unlike every other endpoint, the response is not
+   * enveloped in `data`.
+   */
+  async health(options: { deep?: boolean } = {}, requestOptions: RequestConfig = {}): Promise<HealthResponse> {
+    return this.request<HealthResponse>({
+      method: "GET",
+      path: "/health",
+      query: options.deep ? { deep: "1" } : undefined,
+      skipAuth: true,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 17. GET /me                                                           */
+  /* ---------------------------------------------------------------------- */
+
+  /** The calling account's own id, email, name, role and (if any) organization id. */
+  async me(requestOptions: RequestConfig = {}): Promise<ApiResponse<MeData, undefined>> {
+    return this.request<ApiResponse<MeData, undefined>>({
+      method: "GET",
+      path: "/me",
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 18. GET /audit                                                        */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Fetches this API key's own logged calls (or, for an org admin, an
+   * organization's), with summary stats and a top-endpoints breakdown.
+   * Exactly one of `organizationId`/`userId` should be supplied; supplying
+   * a `userId` other than your own, or an `organizationId` you do not
+   * belong to, throws `PermissionError`.
+   */
+  async audit(options: AuditOptions = {}, requestOptions: RequestConfig = {}): Promise<AuditResponse> {
+    return this.request<AuditResponse>({
+      method: "GET",
+      path: "/audit",
+      query: {
+        organizationId: options.organizationId,
+        userId: options.userId,
+        limit: options.limit,
+        offset: options.offset,
+        startDate: options.startDate,
+        endDate: options.endDate,
+      },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 19. GET /reference/courts                                             */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The court taxonomy accepted by `court` filters elsewhere in this API:
+   * the 4 court types, courts per type, and display names per court. No
+   * API key required. Cached for 1 hour server side (`ETag`/`Cache-Control`),
+   * this SDK does not send `If-None-Match` itself.
+   */
+  async referenceCourts(requestOptions: RequestConfig = {}): Promise<ReferenceCourtsResponse> {
+    return this.request<ReferenceCourtsResponse>({
+      method: "GET",
+      path: "/reference/courts",
+      skipAuth: !this.apiKey,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 20. GET /reference/case-types                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Every `caseType` value accepted elsewhere in this API, deduplicated by
+   * code and sorted. No API key required, same caching as
+   * `referenceCourts`.
+   */
+  async referenceCaseTypes(requestOptions: RequestConfig = {}): Promise<ReferenceCaseTypesResponse> {
+    return this.request<ReferenceCaseTypesResponse>({
+      method: "GET",
+      path: "/reference/case-types",
+      skipAuth: !this.apiKey,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 21. POST /party/screen/batch                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Screens up to 25 names in one call. Each item is independently priced
+   * and can independently fail without failing the whole batch - check
+   * `ok` on each entry in `data.results`. Not available on the Free tier.
+   * LLM adjudication is not supported here (`adjudicate` may only be
+   * `false`/omitted); use `screenParty` one at a time for that. See
+   * `screenParty` for the DPDP note: `purpose` is required and is the only
+   * thing about the query the server retains in its logs.
+   */
+  async screenPartyBatch(
+    options: PartyScreenBatchOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<PartyScreenBatchResult, PartyScreenBatchMeta>> {
+    return this.request<ApiResponse<PartyScreenBatchResult, PartyScreenBatchMeta>>({
+      method: "POST",
+      path: "/party/screen/batch",
+      body: options,
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.screenParty,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
 
@@ -589,7 +783,7 @@ export class CourtMeshClient {
     return url.toString();
   }
 
-  private buildHeaders(hasBody: boolean, skipAuth: boolean): Record<string, string> {
+  private buildHeaders(hasBody: boolean, skipAuth: boolean, idempotencyKey?: string): Record<string, string> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (!skipAuth && this.apiKey) {
       headers.Authorization = `Bearer ${this.apiKey}`;
@@ -597,7 +791,23 @@ export class CourtMeshClient {
     if (hasBody) {
       headers["Content-Type"] = "application/json";
     }
+    if (idempotencyKey) {
+      headers["Idempotency-Key"] = idempotencyKey;
+    }
     return headers;
+  }
+
+  /**
+   * Resolves the `Idempotency-Key` to send for one of the five
+   * idempotency-aware POST methods: the caller's own explicit key, else an
+   * auto-generated UUID v4 when `retryPosts` is in effect for this call
+   * (the per-call override, falling back to the client's own default), else
+   * `undefined` (no header sent).
+   */
+  private resolveIdempotencyKey(requestOptions: RequestConfig): string | undefined {
+    if (requestOptions.idempotencyKey) return requestOptions.idempotencyKey;
+    const retryPosts = requestOptions.retryPosts ?? this.retryPosts;
+    return retryPosts ? generateIdempotencyKey() : undefined;
   }
 
   private async request<T>(opts: RequestOptions): Promise<T> {
@@ -618,7 +828,7 @@ export class CourtMeshClient {
       try {
         response = await this.fetchImpl(url, {
           method: opts.method,
-          headers: this.buildHeaders(opts.body !== undefined, opts.skipAuth ?? false),
+          headers: this.buildHeaders(opts.body !== undefined, opts.skipAuth ?? false, opts.idempotencyKey),
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
           signal: controller.signal,
         });
@@ -687,6 +897,22 @@ export class CourtMeshClient {
 
       if (!response.ok) {
         throw mapStatusToError(response.status, extractErrorMessage(json, response.status), json, headerRequestId);
+      }
+
+      if (isRecord(json)) {
+        // Backfill requestId from the X-Request-Id header for every success
+        // response that does not already carry one somewhere in its body
+        // (some endpoints, e.g. GET /usage, set their own meta.requestId
+        // directly - both can coexist, they are not in conflict).
+        if (json.requestId === undefined && headerRequestId) {
+          json.requestId = headerRequestId;
+        }
+        // Only the five idempotency-key-aware POST methods ever receive
+        // this header, so this is a no-op on every other endpoint.
+        const idempotencyReplayed = response.headers.get("idempotency-replayed");
+        if (idempotencyReplayed && idempotencyReplayed.toLowerCase() === "true") {
+          json.replayed = true;
+        }
       }
 
       return json as T;

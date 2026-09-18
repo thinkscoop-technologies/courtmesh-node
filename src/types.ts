@@ -28,6 +28,24 @@ export interface ApiResponse<T, M = Record<string, unknown>> {
   data: T;
   meta?: M;
   pagination?: KeywordSearchPagination | SemanticSearchPagination;
+  /**
+   * Backfilled by this SDK from the `X-Request-Id` response header when the
+   * server did not already put a `requestId` somewhere in the body. Some
+   * endpoints (for example `GET /usage`, `POST /party/screen/batch`) also
+   * carry their own `meta.requestId` sent directly by the server; both can
+   * be present, they are not in conflict.
+   */
+  requestId?: string;
+  /**
+   * `true` only when this call sent an `Idempotency-Key` that matched a
+   * previous request within its 24 hour window: the server returned the
+   * stored response instead of doing the work again, and nothing was
+   * charged. Backfilled from the `Idempotency-Replayed` response header,
+   * present only on the five idempotency-key-aware POST methods
+   * (`screenParty`, `screenPartyBatch`, `analyzeCase`,
+   * `analyzeConsolidated`, `requestTimeline`).
+   */
+  replayed?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -647,12 +665,35 @@ export interface GetTimelineMeta {
 /* 12. GET /health                                                            */
 /* -------------------------------------------------------------------------- */
 
-/** Not enveloped in `data`, this endpoint has its own top level shape. */
+/** One dependency's result within `HealthResponse.checks` (`deep: true` only). */
+export interface HealthCheckResult {
+  status: "ok" | "degraded" | "down" | (string & {});
+  latencyMs?: number;
+  error?: string;
+}
+
+/**
+ * Not enveloped in `data`, this endpoint has its own top level shape.
+ *
+ * `commit`, `checks` and `requestId` are only present when the plain form
+ * (`deep` not passed, or falsy) is being described loosely - in practice
+ * `commit` is always sent, `checks` only when `deep: true` was passed to
+ * `health()`, and `requestId` is backfilled by this SDK from the
+ * `X-Request-Id` response header. `status` is `"healthy"` on the plain
+ * form; the deep form's `status` is one of `"healthy"`, `"degraded"` or
+ * `"unhealthy"` (the last one only alongside HTTP 503, meaning a hard
+ * dependency - Mongo or OpenSearch - is down).
+ */
 export interface HealthResponse {
-  success: true;
+  success: boolean;
   status: string;
   version: string;
+  /** The deployed commit SHA, or `null` when the server has no `GIT_SHA` set. */
+  commit?: string | null;
+  /** Present only when `deep: true` was passed: one entry per dependency (Mongo, OpenSearch, Qdrant, Redis, IAM). */
+  checks?: Record<string, HealthCheckResult>;
   timestamp: string;
+  requestId?: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -915,4 +956,278 @@ export interface CoverageMeta {
   /** How long this response may be served from cache, currently 21600 (6 hours). */
   cacheTtlSeconds: number;
   corpusNote?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 15. GET /usage                                                             */
+/* -------------------------------------------------------------------------- */
+
+export type ApiTier = "free" | "payg" | "scale" | "enterprise" | (string & {});
+
+export interface UsageWalletOwner {
+  type: "user" | "org";
+  id: string;
+}
+
+export interface UsageBalance {
+  total: number;
+  monthlyGrant: number;
+  signupGrant: number;
+  purchased: number;
+}
+
+/** Mirrors the server's `TierLimits` (server/config/api-tiers.ts). `-1` means unlimited on any per period field. */
+export interface UsageTierLimits {
+  requestsPerMinute: number;
+  requestsPerDay: number;
+  requestsPerMonth: number;
+  maxPageSize: number;
+  maxPaginationDepth: number;
+  distinctCaseFetchesPerDay: number;
+  pdfCallsPerMonth: number;
+  aiCallsPerMonth: number;
+  concurrentAnalyzeJobs: number;
+  apiKeys: number;
+  semanticSearchAllowed: boolean;
+  liveFetchAllowed: boolean;
+  liveFetchesPerDay: number;
+  analysisReadAllowed: boolean;
+  partyScreensPerMonth: number;
+}
+
+/** The [start, end] ISO timestamps of the Asia/Kolkata calendar month this usage was aggregated over. */
+export interface UsagePeriod {
+  start: string;
+  end: string;
+  /** `"YYYY-MM"`. */
+  key: string;
+}
+
+export interface UsageByEndpoint {
+  endpoint: string;
+  calls: number;
+  credits: number;
+}
+
+export interface UsageData {
+  tier: ApiTier;
+  walletOwner: UsageWalletOwner;
+  balance: UsageBalance;
+  limits: UsageTierLimits;
+  period: UsagePeriod;
+  creditsUsedThisPeriod: number;
+  byEndpoint: UsageByEndpoint[];
+  subscriptionRenewsAt: string | null;
+}
+
+export interface UsageMeta {
+  requestId: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 16. GET /me                                                                */
+/* -------------------------------------------------------------------------- */
+
+export interface MeData {
+  userId: string;
+  email?: string;
+  name: string | null;
+  role: string | null;
+  /** Only present when the account belongs to an organization. */
+  organizationId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 17. GET /audit                                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface AuditOptions {
+  /** Required if `userId` is omitted. Must be the caller's own organization, or `PermissionError`. */
+  organizationId?: string;
+  /** Required if `organizationId` is omitted. Must be the caller's own id, or an org admin's teammate, or `PermissionError`. */
+  userId?: string;
+  /** 1..200, default 50. */
+  limit?: number;
+  /** Default 0. */
+  offset?: number;
+  /** ISO 8601. */
+  startDate?: string;
+  /** ISO 8601. */
+  endDate?: string;
+}
+
+export interface AuditHit {
+  id: string;
+  userId?: string;
+  organizationId?: string;
+  endpoint: string;
+  method: string;
+  statusCode: number;
+  responseTime: number;
+  isAiAnalysis?: boolean;
+  creditsDeducted?: number;
+  metadata?: Record<string, unknown>;
+  ipAddress?: string;
+  userAgent?: string;
+  createdAt: string;
+}
+
+export interface AuditTopEndpoint {
+  endpoint: string;
+  count: number;
+}
+
+export interface AuditSummary {
+  totalHits: number;
+  totalAiAnalysisHits: number;
+  avgResponseTime: number;
+  successfulHits: number;
+  /** A string, e.g. `"98.5"` - the server formats it with `toFixed(1)`. */
+  successRate: string;
+  totalCreditsDeducted: number;
+}
+
+export interface AuditData {
+  hits: AuditHit[];
+  summary: AuditSummary;
+  topEndpoints: AuditTopEndpoint[];
+}
+
+export interface AuditPagination {
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+/** `GET /audit` nests its own pagination shape under the envelope, distinct from `KeywordSearchPagination`/`SemanticSearchPagination`. */
+export interface AuditResponse {
+  success: true;
+  data: AuditData;
+  pagination: AuditPagination;
+  requestId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 18. GET /reference/courts                                                 */
+/* -------------------------------------------------------------------------- */
+
+/** court/courtType -> display name(s). */
+export type CourtNamesMap = Record<string, string[]>;
+
+export interface CourtHierarchy {
+  /** The 4 court types (level 1). */
+  courtTypes: string[];
+  /** courtType -> court values (level 2). High Court is collapsed to representatives. */
+  courtsByType: CourtNamesMap;
+  /** court -> courtName values (level 3). Includes an entry per High Court representative. */
+  courtNamesByCourt: CourtNamesMap;
+}
+
+/** No API key required. Not enveloped with `meta`, only `data`. */
+export interface ReferenceCourtsResponse {
+  success: true;
+  data: CourtHierarchy;
+  requestId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 19. GET /reference/case-types                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface CaseTypeEntry {
+  code: string;
+  fullForm: string;
+  primaryType: string;
+  nature: string;
+}
+
+/** No API key required. Not enveloped with `meta`, only `data`. Deduplicated by code, sorted. */
+export interface ReferenceCaseTypesResponse {
+  success: true;
+  data: CaseTypeEntry[];
+  requestId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 20. POST /party/screen/batch                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface PartyScreenBatchItem {
+  /** Echoed back on the matching result item so you can line results up with requests; not sent to the server otherwise. */
+  clientRef?: string;
+  /** Required, 2..200 characters. */
+  name: string;
+  /** Alternate spellings or names, at most 7. */
+  aliases?: string[];
+  /** Falls back to the batch level `entityType` when omitted here. */
+  entityType?: PartyEntityType;
+  identifiers?: PartyScreenIdentifiers;
+  address?: PartyScreenAddress;
+  knownPersons?: string[];
+  court?: StringOrArray;
+  /** `YYYY-MM-DD`. */
+  since?: string;
+  /** 1..100, default 40. */
+  limit?: number;
+  /** Minimum calibrated confidence score, 0..1. */
+  displayThreshold?: number;
+}
+
+export interface PartyScreenBatchOptions {
+  /** 1..25 items. */
+  items: PartyScreenBatchItem[];
+  /** Required, drives DPDP purpose limitation logging for every item in this batch. */
+  purpose: PartyScreenPurpose;
+  /** Default entityType applied to any item that does not specify its own. */
+  entityType?: PartyEntityType;
+  /**
+   * LLM adjudication is not supported in the batch endpoint. This field
+   * only ever accepts `false` (or omission); pass `adjudicate: true` to
+   * `screenParty` one item at a time instead.
+   */
+  adjudicate?: false;
+}
+
+export interface PartyScreenBatchItemOk {
+  clientRef?: string;
+  /** The item's 0 based position in the request's `items` array. */
+  index: number;
+  ok: true;
+  screen: PartyScreenResult;
+}
+
+export interface PartyScreenBatchItemError {
+  clientRef?: string;
+  index: number;
+  ok: false;
+  error: {
+    code: string;
+    message: string;
+  };
+}
+
+export type PartyScreenBatchItemResult = PartyScreenBatchItemOk | PartyScreenBatchItemError;
+
+export interface PartyScreenBatchSummary {
+  items: number;
+  matchesFound: number;
+  noMatches: number;
+  inconclusive: number;
+  errors: number;
+}
+
+export interface PartyScreenBatchResult {
+  results: PartyScreenBatchItemResult[];
+  summary: PartyScreenBatchSummary;
+}
+
+export interface PartyScreenBatchMeta {
+  /** Sum of the credits charged across every item that ran (a per-item error charges nothing for that item). */
+  creditsCharged: number;
+  requestId: string;
+  /** Present, and `true`, only when the batch itself was clamped (for example the server capped how many items it would run). */
+  truncated?: boolean;
+  /** Present only alongside `truncated: true`. */
+  truncatedReason?: string;
 }

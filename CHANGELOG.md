@@ -7,6 +7,71 @@ Each entry also states which server flags/behaviour the version targets on
 the CourtMesh research server, since some of this SDK's contract only takes
 effect once a given server flag is on for your account.
 
+## [0.4.0]
+
+Targets the research server's account-introspection endpoints
+(`GET /usage`, `GET /me`, `GET /audit`), the public reference endpoints
+(`GET /reference/courts`, `GET /reference/case-types`), the new
+`POST /party/screen/batch` endpoint, and the `Idempotency-Key` contract
+being rolled out across the five job/charge-triggering POST endpoints.
+
+### Added
+
+- `usage()`: `GET /usage`, this key's tier, wallet balance, `TIER_LIMITS` for
+  that tier, the current Asia/Kolkata billing period and a per endpoint call
+  breakdown. Unmetered.
+- `me()`: `GET /me`, the calling account's id, email, name, role and (if
+  any) organization id.
+- `audit(options)`: `GET /audit`, this key's own logged calls (or, for an
+  org admin, an organization's), with summary stats and a top-endpoints
+  breakdown. Takes `organizationId`, `userId`, `limit`, `offset`,
+  `startDate`, `endDate`.
+- `referenceCourts()`: `GET /reference/courts`, the court taxonomy accepted
+  by `court` filters elsewhere in this API. No API key required.
+- `referenceCaseTypes()`: `GET /reference/case-types`, every `caseType`
+  value accepted elsewhere in this API. No API key required.
+- `screenPartyBatch(options)`: `POST /party/screen/batch`, screens 1 to 25
+  names in one call; each item is independently priced and can
+  independently fail (`data.results[i].ok`) without failing the whole
+  batch. Not available on the Free tier. LLM adjudication is not supported
+  in the batch endpoint.
+- `health()` now takes an options argument, `health({ deep: true })` calls
+  `GET /health?deep=1`: also checks Mongo, OpenSearch, Qdrant, Redis and IAM
+  standing, and reports `status: "degraded"`/`"unhealthy"` plus a
+  `checks` object per dependency. `HealthResponse` gained `commit` and
+  `checks`.
+- `idempotencyKey` option on `screenParty`, `screenPartyBatch`,
+  `analyzeCase`, `analyzeConsolidated` and `requestTimeline`: sent as the
+  `Idempotency-Key` header (1 to 128 characters, `[A-Za-z0-9_.-]`, scoped
+  per API key for 24 hours). A replayed call with the same key and body
+  returns the stored response again (`response.replayed === true`, no new
+  charge); the same key with a different body throws `ValidationError`
+  with `apiCode === "IDEMPOTENCY_KEY_REUSED"`. When omitted, and
+  `retryPosts` is in effect for that call (the call's own override, or the
+  client's default), the SDK auto-generates a UUID v4 so an automatic retry
+  of that exact call is always safe from a double charge or a double-run
+  job.
+- `ApiResponse.requestId`: every response now carries the request id, either
+  the server's own `meta.requestId`/body-level `requestId` when it set one,
+  or (as a fallback the SDK backfills client side) the `X-Request-Id`
+  response header.
+- `ApiResponse.replayed`: `true` when the response carried
+  `Idempotency-Replayed: true`.
+- `ConflictError` (409): thrown by the five idempotency-key-aware POST
+  methods when the same `Idempotency-Key` was reused with a different body
+  (`apiCode === "IDEMPOTENCY_KEY_REUSED"`) or a request with that key is
+  still in flight (`apiCode === "IDEMPOTENCY_IN_PROGRESS"`).
+  `IDEMPOTENCY_KEY_REUSED`, `IDEMPOTENCY_IN_PROGRESS` and
+  `IDEMPOTENCY_KEY_INVALID` added to `API_REFUSAL_CODES`/`ApiRefusalCode`.
+- New types: `ApiTier`, `UsageData`/`UsageMeta`/`UsageBalance`/
+  `UsageTierLimits`/`UsagePeriod`/`UsageByEndpoint`/`UsageWalletOwner`,
+  `MeData`, `AuditOptions`/`AuditResponse`/`AuditHit`/`AuditSummary`/
+  `AuditTopEndpoint`/`AuditPagination`, `CourtHierarchy`/`CourtNamesMap`/
+  `ReferenceCourtsResponse`, `CaseTypeEntry`/`ReferenceCaseTypesResponse`,
+  `PartyScreenBatchOptions`/`PartyScreenBatchItem`/`PartyScreenBatchResult`/
+  `PartyScreenBatchItemResult`/`PartyScreenBatchSummary`/
+  `PartyScreenBatchMeta`, `HealthCheckResult`.
+
 ## [0.3.0]
 
 Targets the research server after the 2026-09-18 API abuse-control and
