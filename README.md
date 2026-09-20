@@ -160,7 +160,7 @@ console.log(data.relatedDocuments.length, data.timeline);
 
 ```ts
 const { data } = await client.getCasePdf("64f0c2...");
-// data.pdfUrl is CIPHERTEXT, not a fetchable URL, see Caveats below.
+// data.pdfUrl is a fetchable link: no API key, no decryption, no credits.
 console.log(data.expiresIn); // 3600
 ```
 
@@ -385,7 +385,6 @@ A client side timeout does not cancel the request server side and never triggers
 
 ## Caveats (from the live API behaviour, not SDK bugs)
 
-- **`getCasePdf`'s `pdfUrl` is ciphertext, not a fetchable URL.** Decrypting it uses a case specific key and is outside this API surface.
 
 ## Publishing
 

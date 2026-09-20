@@ -493,7 +493,7 @@ export interface RelatedMeta {
 /* -------------------------------------------------------------------------- */
 
 export interface PdfResponse {
-  /** Ciphertext, not a fetchable URL, decryption is not part of this API surface. */
+  /** A directly fetchable HTTPS link on the CourtMesh API host. Carries its own short lived signed token, so it needs no API key, no decryption, and costs no credits to fetch. */
   pdfUrl: string;
   /** Always 3600, the URL is valid for one hour. */
   expiresIn: number;
