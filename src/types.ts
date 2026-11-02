@@ -114,7 +114,9 @@ export interface SearchCasesOptions {
   /**
    * Exact CNR match (no fuzzy text matching). Any common spelling is
    * accepted and normalised to the canonical 16 characters before sending.
-   * When present, `query` is optional.
+   * When present, `query` is optional and ignored. The result is one
+   * ordinary search hit (or an empty list), not the full record: progress
+   * fields and `orderCount` are only on `getCaseByCnr`.
    */
   cnr?: string;
   court?: StringOrArray;

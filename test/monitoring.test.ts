@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { CourtMeshClient } from "../src/client.js";
-import { NotFoundError } from "../src/errors.js";
+import { NotFoundError, ValidationError } from "../src/errors.js";
 import { normalizeCnr, assertCnr, verifyWebhookSignature, WebhookSignatureError } from "../src/monitoring.js";
 import { queueFetch } from "./helpers.js";
 
@@ -408,5 +408,48 @@ describe("verifyWebhookSignature", () => {
     const sig = createHmac("sha256", "whsec_x").update(`${t}.${body}`).digest("hex");
     expect(verifyWebhookSignature(body, `t=${t},v1=${sig}`, "whsec_x").id).toBe("evt_1");
     expect(() => verifyWebhookSignature(vector.rawBody, header, vector.secret)).toThrow(/tolerance/);
+  });
+});
+
+describe("final server behaviour", () => {
+  it("lists an unavailable item with null case fields", async () => {
+    const item = {
+      cnr: CNR, reference: "R1", label: null, status: "unavailable",
+      caseId: null, court: null, title: null, lastCheckedAt: null, lastChangedAt: null, snapshot: null, addedAt: "2026-11-02T00:00:00.000Z",
+    };
+    const { client, calls } = makeClient([list([item], null)]);
+    const res = await client.listWatchlistItems("wl_1", { status: "unavailable" });
+    expect(calls[0]?.url).toBe(`${BASE}/watchlists/wl_1/items?status=unavailable`);
+    expect(res.data[0]?.status).toBe("unavailable");
+    expect(res.data[0]?.snapshot).toBeNull();
+  });
+
+  it("returns cap_exceeded and not_found results as data, not errors", async () => {
+    const { client } = makeClient([
+      ok({
+        results: [
+          { cnr: CNR, result: "cap_exceeded", message: "The daily limit for adding case numbers has been reached. It resets at midnight IST." },
+          { cnr: "DLHC010084212022", result: "not_found", message: "eCourts had no such case when we last looked. Try again tomorrow." },
+        ],
+        itemCount: 3,
+      }),
+    ]);
+    const res = await client.addWatchlistItems("wl_1", [{ cnr: CNR }, { cnr: "DLHC010084212022" }]);
+    expect(res.data.results.map((r) => r.result)).toEqual(["cap_exceeded", "not_found"]);
+  });
+
+  it("fetch=true in the cooldown throws NotFoundError", async () => {
+    const { client } = makeClient([{ status: 404, body: { success: false, error: "No case with this CNR was found.", code: "CASE_NOT_FOUND", cnr: CNR, status: "not_found" } }]);
+    const err: any = await client.getCaseByCnr(CNR, { fetch: true }).catch((e) => e);
+    expect(err).toBeInstanceOf(NotFoundError);
+    expect(err.apiCode).toBe("CASE_NOT_FOUND");
+  });
+
+  it("keeps query validation details as path: message strings", async () => {
+    const details = ["limit: limit cannot exceed 100."];
+    const { client } = makeClient([{ status: 400, body: { success: false, error: "Validation failed. Please check your request and try again.", code: "VALIDATION_ERROR", details } }]);
+    const err: any = await client.listChanges({ limit: 500 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect(err.details).toEqual(details);
   });
 });

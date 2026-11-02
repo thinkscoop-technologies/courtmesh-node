@@ -143,9 +143,9 @@ export interface RequestConfig {
    * Only meaningful on the POST methods that accept an `Idempotency-Key`
    * header: `screenParty`, `screenPartyBatch`, `analyzeCase`,
    * `analyzeConsolidated`, `requestTimeline`, `createWatchlist`,
-   * `addWatchlistItems`. (The webhook POST methods `createWebhook`,
-   * `rotateWebhookSecret`, `testWebhook` and `retryWebhookDelivery` accept
-   * the option too, but the server does not deduplicate them.) 1 to 128 characters,
+   * `addWatchlistItems`, `createWebhook`. (`rotateWebhookSecret`,
+   * `testWebhook` and `retryWebhookDelivery` accept the option too, but the
+   * server does not deduplicate them.) 1 to 128 characters,
    * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
    * the same key and the same body returns the stored 2xx response again
    * (`response.replayed` is then `true`) with no new charge; the same key
@@ -846,7 +846,9 @@ export class CourtMeshClient {
    * do not hold yet. The call that starts the fetch returns `pending` and is
    * free; the poll that returns the record is the one 1 credit charge, and a
    * fetch the court portal cannot satisfy costs nothing. Fetches share the
-   * daily live fetch cap with `requestTimeline({ refresh: true })`.
+   * daily live fetch cap with `requestTimeline({ refresh: true })`. If the
+   * court portal had nothing for the CNR in the last 24 hours, `fetch: true`
+   * does not call it again: it throws `NotFoundError` immediately.
    */
   async getCaseByCnr(
     cnr: string,
@@ -928,6 +930,12 @@ export class CourtMeshClient {
    * Adds 1 to 100 CNRs to a watchlist. Each gets a result in `data.results`:
    * `watching`, `pending` (not in the corpus yet, so a live fetch was
    * started), `invalid`, `duplicate`, `cap_exceeded` or `not_found`.
+   *
+   * `cap_exceeded` also means you passed the daily add allowance for the
+   * account (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise
+   * 500,000 per Indian calendar day) or the daily limit on new CNRs.
+   * `not_found` is returned for a case taken down at a party's request and
+   * for a CNR the court portal had nothing for in the last 24 hours.
    */
   async addWatchlistItems(
     id: string,
@@ -1088,7 +1096,13 @@ export class CourtMeshClient {
     return this.postJson(`/webhooks/${encodeURIComponent(id)}/rotate-secret`, undefined, requestOptions);
   }
 
-  /** Sends a `webhook.test` event to the endpoint now (a single attempt, never retried) and returns the delivery object. */
+  /**
+   * Sends a `webhook.test` event to the endpoint now (a single attempt, never
+   * retried) and returns the delivery object. It is sent even if the endpoint
+   * is switched off, and does not count toward its failure streak. Each
+   * attempt has a hard 10 second deadline and reads at most 64 KB of your
+   * response.
+   */
   async testWebhook(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<WebhookDelivery>> {
     return this.postJson(`/webhooks/${encodeURIComponent(id)}/test`, undefined, requestOptions);
   }

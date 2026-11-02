@@ -86,6 +86,9 @@ export interface GetCaseByCnrOptions {
    * The call that starts it returns `pending` and is free; the poll that
    * returns the record is the single 1 credit charge, and a failed fetch is
    * free. Counts against the same daily live fetch cap as a timeline refresh.
+   * If the court portal had nothing for this CNR in the last 24 hours, no
+   * new fetch is started and the call throws `NotFoundError`
+   * (`CASE_NOT_FOUND`) straight away.
    */
   fetch?: boolean;
 }
@@ -140,6 +143,15 @@ export interface Watchlist {
   metadata?: Record<string, unknown> | null;
 }
 
+/**
+ * `cap_exceeded` covers three limits: your watched CNR cap, the daily limit on
+ * adding CNRs we do not hold yet, and the daily add allowance per account
+ * (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000, counted per
+ * Indian calendar day). `message` says which. `not_found` also covers a case
+ * that was taken down (it is stored as an `unavailable` item) and a CNR the
+ * court portal had nothing for in the last 24 hours (nothing is refetched
+ * until that cooldown passes).
+ */
 export type WatchItemResultCode = "watching" | "pending" | "invalid" | "duplicate" | "cap_exceeded" | "not_found";
 
 /** Outcome of adding one CNR. A partial success is still HTTP 200. */
@@ -159,8 +171,14 @@ export interface AddWatchlistItemsResult {
   itemCount?: number;
 }
 
-export type WatchItemStatus = "watching" | "pending" | "not_found" | "error";
+/**
+ * `unavailable` means the case was taken down at a party's request. No events
+ * are sent for it, and `caseId`, `court`, `title`, `snapshot`, `lastCheckedAt`
+ * and `lastChangedAt` are all `null`.
+ */
+export type WatchItemStatus = "watching" | "pending" | "not_found" | "error" | "unavailable";
 
+/** Dates are `YYYY-MM-DD` (Indian calendar). A court's year 9999 "no date" comes back as `null`. */
 export interface WatchSnapshot {
   caseStatus?: string | null;
   caseStage?: string | null;
@@ -213,7 +231,15 @@ export interface ChangeEventWatchlistRef {
   reference?: string | null;
 }
 
-/** One change event. The feed and the webhook body are identical. */
+/**
+ * One change event. The feed and the webhook body are identical.
+ *
+ * `case.tracking_started` arrives once the first fresh refresh of the case
+ * completes (immediately when the stored record is already current), not at
+ * the moment of the add. After that, a burst of new orders announces only the
+ * newest 20, and an order dated more than 7 days before you started watching
+ * is never announced to you. A taken down case sends no events.
+ */
 export interface ChangeEvent<TData = Record<string, unknown>> {
   /** Starts with `evt_`. Dedupe on this: delivery is at least once. */
   id: string;
@@ -226,7 +252,11 @@ export interface ChangeEvent<TData = Record<string, unknown>> {
 }
 
 export interface ListChangesOptions extends CursorListOptions {
-  /** ISO timestamp, used when there is no `cursor`. */
+  /**
+   * ISO timestamp, used when there is no `cursor`. It is turned into a feed
+   * position once; the `nextCursor` you get back continues from there.
+   * Cursors are opaque: store them, never build or parse them.
+   */
   since?: string;
   /** Event types to include. */
   types?: ChangeEventType | string | Array<ChangeEventType | string>;
@@ -241,9 +271,9 @@ export interface ListChangesOptions extends CursorListOptions {
 export interface CreateWebhookOptions {
   /** https only. */
   url: string;
-  /** Event types to receive. Defaults to every `case.*` type. */
+  /** Event types to receive. Defaults to every `case.*` type; the response and later reads echo the full list. */
   events?: Array<ChangeEventType | string>;
-  /** Limit to these watchlists. Defaults to all. */
+  /** Limit to these watchlists. Defaults to all; `[]` also means all and is what the response echoes when you send none. */
   watchlistIds?: string[];
   /** Up to 200 characters. */
   description?: string;
@@ -280,6 +310,10 @@ export interface WebhookWithSecret extends Webhook {
 
 export type WebhookDeliveryStatus = "pending" | "succeeded" | "failed";
 
+/**
+ * `lastError` is `"expired"` on a delivery that was never attempted for 24
+ * hours and was therefore marked `failed` instead of being sent.
+ */
 export interface WebhookDelivery {
   /** Starts with `whd_`. */
   id: string;
