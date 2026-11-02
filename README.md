@@ -199,7 +199,7 @@ console.log(data.status, data.consolidatedAnalysis.outcome, meta?.relatedCases);
 
 ### 10. `requestTimeline`, `POST /request-timeline`
 
-`caseId` must be a Mongo ObjectId string. `refresh: true` forces a live court-portal fetch (20 credits) instead of serving the last stored read (1 credit) - `meta.liveFetch` says which one actually happened, `data.liveFetchSupported` comes back `false` when the case's court has no live refresh at all. Not available on the Free tier (`LIVE_FETCH_NOT_ALLOWED`, 403) and capped per day per tier (`LIVE_FETCH_LIMIT_REACHED`, 429).
+`caseId` must be a Mongo ObjectId string. `refresh: true` forces a live court-portal fetch instead of serving the last stored read. Both cost 1 credit, and `meta.liveFetch` says which one actually happened; `data.liveFetchSupported` comes back `false` when the case's court has no live refresh at all. Not available on the Free tier (`LIVE_FETCH_NOT_ALLOWED`, 403) and capped per day per tier (`LIVE_FETCH_LIMIT_REACHED`, 429).
 
 ```ts
 const { data, meta } = await client.requestTimeline("64f0c2...");
@@ -269,6 +269,96 @@ for (const court of data.courts) {
 }
 console.log(data.districtCourts.records);
 ```
+
+## CNR lookup and case monitoring
+
+Look a case up by CNR (any common spelling works), or watch a list of CNRs and be told when something changes. Tracking is free within your plan's watch cap; you pay only for reading the change feed (1 credit per non-empty page of up to 100 events) and for CNR lookups (1 credit per record returned).
+
+```ts
+import { CourtMeshClient, normalizeCnr } from "@courtmesh/sdk";
+
+const client = new CourtMeshClient({ apiKey: process.env.COURTMESH_API_KEY });
+
+normalizeCnr("CNR: DLHC-01-008421-2021"); // "DLHC010084212021", or null if it cannot be a CNR
+
+// One-off lookup. fetch: true starts a live fetch for a CNR we do not hold yet.
+const lookup = await client.getCaseByCnr("DLHC010084212021", { fetch: true });
+console.log(lookup.data.status); // "found" | "pending"
+
+// 1. Watch a CNR.
+const wl = await client.createWatchlist({
+  name: "Loan book",
+  items: [{ cnr: "DLHC010084212021", reference: "LOAN-42" }],
+});
+console.log(wl.data.id, wl.data.results); // per item: watching | pending | invalid | duplicate | cap_exceeded | not_found
+
+// 2. Poll /changes. Store nextCursor and pass it back next time.
+let cursor: string | undefined = loadCursorFromYourStore();
+const page = await client.listChanges({ cursor, types: ["case.hearing_date_changed", "case.order_added"] });
+for (const event of page.data) {
+  console.log(event.type, event.cnr, event.data);
+}
+saveCursorToYourStore(page.pagination.nextCursor); // returned even when the page is empty
+
+// Or walk everything until caught up.
+for await (const events of client.iterChanges({ since: "2026-11-01T00:00:00Z" })) {
+  for (const event of events) handle(event);
+}
+```
+
+### Receive webhooks
+
+Create an endpoint (https only). The `secret` is shown once, so store it.
+
+```ts
+const hook = await client.createWebhook({ url: "https://example.com/hooks/courtmesh" });
+console.log(hook.data.secret); // whsec_...
+await client.testWebhook(hook.data.id); // sends a webhook.test event now
+```
+
+Verify every delivery with the RAW request body. Express example:
+
+```ts
+import express from "express";
+import { verifyWebhookSignature, WebhookSignatureError } from "@courtmesh/sdk";
+
+const app = express();
+
+app.post("/hooks/courtmesh", express.raw({ type: "application/json" }), (req, res) => {
+  let event;
+  try {
+    event = verifyWebhookSignature(req.body, req.header("CourtMesh-Signature"), process.env.COURTMESH_WEBHOOK_SECRET!);
+  } catch (err) {
+    if (err instanceof WebhookSignatureError) return res.status(400).send("bad signature");
+    throw err;
+  }
+  // Delivery is at least once: dedupe on event.id (also sent as the CourtMesh-Event-Id header).
+  console.log(event.type, event.cnr);
+  res.sendStatus(200); // any 2xx within 10 seconds counts as delivered
+});
+```
+
+`verifyWebhookSignature(rawBody, header, secret, { toleranceSeconds = 300 })` rejects a timestamp more than 300 seconds from now, computes HMAC-SHA256 over `"<t>.<rawBody>"` and compares in constant time against every `v1=` value in the header (two during a 24 hour secret rotation). Pass an array of secrets to cover your side of a rotation. It returns the parsed event or throws `WebhookSignatureError`. It uses `node:crypto`, so it is for server runtimes.
+
+Failed deliveries are retried after 1 min, 5 min, 30 min, 2 h, 6 h, 12 h and 24 h. Use `listWebhookDeliveries(id)` to inspect attempts and `retryWebhookDelivery(id, deliveryId)` to re-send one.
+
+### Monitoring methods
+
+| Method | Endpoint | Credits |
+|---|---|---|
+| `getCaseByCnr(cnr, { fetch })` | `GET /cases/by-cnr/{cnr}` | 1 when a record is returned |
+| `searchCases({ cnr })` | `POST /search/cases` | as search |
+| `createWatchlist`, `getWatchlist`, `updateWatchlist`, `deleteWatchlist` | `/watchlists` | 0 |
+| `listWatchlists` / `iterWatchlists` | `GET /watchlists` | 0 |
+| `addWatchlistItems`, `removeWatchlistItem` | `/watchlists/{id}/items` | 0 |
+| `listWatchlistItems` / `iterWatchlistItems` | `GET /watchlists/{id}/items` | 0 |
+| `listChanges` / `iterChanges` | `GET /changes` | 1 per non-empty page |
+| `listWatchlistEvents` / `iterWatchlistEvents` | `GET /watchlists/{id}/events` | 1 per non-empty page |
+| `createWebhook`, `getWebhook`, `updateWebhook`, `deleteWebhook`, `rotateWebhookSecret`, `testWebhook` | `/webhooks` | 0 |
+| `listWebhooks` / `iterWebhooks` | `GET /webhooks` | 0 |
+| `listWebhookDeliveries` / `iterWebhookDeliveries`, `retryWebhookDelivery` | `/webhooks/{id}/deliveries` | 0 |
+
+Watch caps per account: Free 10, Pay As You Go 1,000, Scale 10,000, Enterprise by contract. New error codes surface as typed errors with `apiCode` set: `INVALID_CNR`, `WATCHLIST_NOT_FOUND`, `WEBHOOK_NOT_FOUND`, `DELIVERY_NOT_FOUND`, `WATCH_CAP_EXCEEDED`, `WATCHLIST_LIMIT_REACHED`, `WEBHOOK_LIMIT_REACHED`, `INVALID_WEBHOOK_URL`. API keys need the `monitoring:read` and `monitoring:write` scopes (keys without explicit scopes have full access).
 
 ## Pagination
 
@@ -386,19 +476,9 @@ A client side timeout does not cancel the request server side and never triggers
 ## Caveats (from the live API behaviour, not SDK bugs)
 
 
-## Publishing
+## Releasing
 
-These are the exact commands a human runs, they are not automated by this SDK or any script in this repository.
-
-```bash
-# One time: point the local repo at your GitHub remote.
-git remote add origin git@github.com:<your-org>/courtmesh-node.git
-git push -u origin main
-
-# Build and publish to npm.
-npm run build
-npm publish --access public
-```
+Maintainers: see [RELEASING.md](RELEASING.md).
 
 ## License
 

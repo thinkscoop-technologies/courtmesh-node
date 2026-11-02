@@ -7,6 +7,28 @@ Each entry also states which server flags/behaviour the version targets on
 the CourtMesh research server, since some of this SDK's contract only takes
 effect once a given server flag is on for your account.
 
+## [0.5.0]
+
+Adds CNR lookup and case monitoring (API docs 1.3.0).
+
+### Added
+
+- `getCaseByCnr(cnr, { fetch })` for `GET /cases/by-cnr/{cnr}`, and a `cnr` option on `searchCases` (exact match, `query` is now optional when `cnr` is given).
+- Watchlists: `createWatchlist`, `listWatchlists`, `getWatchlist`, `updateWatchlist`, `deleteWatchlist`, `addWatchlistItems`, `listWatchlistItems`, `removeWatchlistItem`.
+- Change feed: `listChanges`, `listWatchlistEvents`, with async iterators `iterChanges` and `iterWatchlistEvents` that walk pages until caught up.
+- Webhooks: `createWebhook`, `listWebhooks`, `getWebhook`, `updateWebhook`, `deleteWebhook`, `rotateWebhookSecret`, `testWebhook`, `listWebhookDeliveries`, `retryWebhookDelivery`, plus `iterWatchlists`, `iterWatchlistItems`, `iterWebhooks` and `iterWebhookDeliveries`.
+- `verifyWebhookSignature(rawBody, header, secret, { toleranceSeconds })` and `WebhookSignatureError`.
+- `normalizeCnr` and `assertCnr`, exported, matching the server's CNR normalisation.
+- Typed models for all of the above, including `ChangeEvent`.
+- `PATCH` and `DELETE` support in the HTTP layer. `DELETE` is retried like `GET`; `PATCH` and all new `POST` calls follow the `retryPosts` rule and send an `Idempotency-Key` when it is in effect.
+- `repository`, `homepage` and `bugs` fields in `package.json`, and a `prepublishOnly` check.
+
+### Changed
+
+- `requestTimeline({ refresh: true })` now costs 1 credit (it was 20). Docs and docstrings updated.
+- `SearchCasesOptions.query` is optional (required unless `cnr` is set).
+- `User-Agent` is `courtmesh-node/0.5.0`.
+
 ## [0.4.1]
 
 Live QA pass against the redeployed production research server

@@ -51,6 +51,29 @@ import type {
   UsageData,
   UsageMeta,
 } from "./types.js";
+import { normalizeCnr } from "./monitoring.js";
+import type {
+  AddWatchlistItemsResult,
+  ChangeEvent,
+  CnrLookupData,
+  CreateWatchlistOptions,
+  CreateWatchlistResult,
+  CreateWebhookOptions,
+  CursorListOptions,
+  CursorListResponse,
+  DeleteResult,
+  GetCaseByCnrOptions,
+  ListChangesOptions,
+  ListWatchlistItemsOptions,
+  UpdateWatchlistOptions,
+  UpdateWebhookOptions,
+  Watchlist,
+  WatchlistItem,
+  WatchlistItemInput,
+  Webhook,
+  WebhookDelivery,
+  WebhookWithSecret,
+} from "./monitoring.js";
 
 /**
  * Injected at build time by tsup's `define` (see tsup.config.ts) from
@@ -59,7 +82,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.4.1";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.5.0";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 
@@ -117,9 +140,11 @@ export interface RequestConfig {
   /** Overrides the client's `retryPosts` default for this one call. Meaningless on a GET. */
   retryPosts?: boolean;
   /**
-   * Only meaningful on `screenParty`, `screenPartyBatch`, `analyzeCase`,
-   * `analyzeConsolidated` and `requestTimeline` - the five endpoints that
-   * accept an `Idempotency-Key` header. 1 to 128 characters,
+   * Only meaningful on the POST methods that accept an `Idempotency-Key`
+   * header: `screenParty`, `screenPartyBatch`, `analyzeCase`,
+   * `analyzeConsolidated`, `requestTimeline`, `createWatchlist`,
+   * `addWatchlistItems`, `createWebhook`, `rotateWebhookSecret`,
+   * `testWebhook` and `retryWebhookDelivery`. 1 to 128 characters,
    * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
    * the same key and the same body returns the stored 2xx response again
    * (`response.replayed` is then `true`) with no new charge; the same key
@@ -158,6 +183,25 @@ const ENDPOINT_TIMEOUT_MS = {
 
 /** The maximum number of pages an async iterator will walk before it gives up as a safety guard. */
 const MAX_ITERATOR_PAGES = 10000;
+
+/** Canonical CNR when the input normalises, else the trimmed input so the server can answer `INVALID_CNR`. */
+function cnrForRequest(cnr: string): string {
+  return normalizeCnr(cnr) ?? String(cnr).trim();
+}
+
+function normalizeItem(item: WatchlistItemInput): WatchlistItemInput {
+  return { ...item, cnr: cnrForRequest(item.cnr) };
+}
+
+function changesQuery(options: ListChangesOptions): Record<string, string | number | undefined> {
+  return {
+    cursor: options.cursor,
+    since: options.since,
+    types: Array.isArray(options.types) ? options.types.join(",") : options.types,
+    cnr: options.cnr === undefined ? undefined : cnrForRequest(options.cnr),
+    limit: options.limit,
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -233,7 +277,7 @@ function generateIdempotencyKey(): string {
 }
 
 interface RequestOptions {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH" | "DELETE";
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
@@ -303,10 +347,12 @@ export class CourtMeshClient {
   /* ---------------------------------------------------------------------- */
 
   async searchCases(options: SearchCasesOptions, requestOptions: RequestConfig = {}): Promise<SearchCasesResponse> {
+    const body: SearchCasesOptions =
+      options.cnr === undefined ? options : { ...options, cnr: normalizeCnr(options.cnr) ?? options.cnr.trim() };
     const response = await this.request<SearchCasesResponse>({
       method: "POST",
       path: "/search/cases",
-      body: options,
+      body,
       timeoutMs: requestOptions.timeoutMs,
       retryPosts: requestOptions.retryPosts,
     });
@@ -780,8 +826,350 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* 22. GET /cases/by-cnr/{cnr}                                           */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Looks a case up by its CNR (any common spelling, normalised for you).
+   * 1 credit, charged only when a record is returned.
+   *
+   * `data.status` is `found` (200, `data.case` holds the record), or
+   * `pending` (202, a live fetch is running: poll this same call, or
+   * `getTimeline(data.requestId)`). A CNR that is not in the corpus and was
+   * not fetched throws `NotFoundError` (`apiCode === "CASE_NOT_FOUND"`).
+   *
+   * Pass `{ fetch: true }` to start a live court portal fetch for a CNR we
+   * do not hold yet: 1 credit once the fetch is accepted, sharing the daily
+   * live fetch cap with `requestTimeline({ refresh: true })`.
+   */
+  async getCaseByCnr(
+    cnr: string,
+    options: GetCaseByCnrOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<CnrLookupData, GetCaseMeta>> {
+    return this.request<ApiResponse<CnrLookupData, GetCaseMeta>>({
+      method: "GET",
+      path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
+      query: options.fetch ? { fetch: true } : undefined,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Watchlists                                                             */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Creates a watchlist, optionally with up to 100 CNRs to start watching.
+   * The result carries one outcome per CNR in `data.results`; a partial
+   * success is still a 200. Management calls are free.
+   */
+  async createWatchlist(
+    options: CreateWatchlistOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<CreateWatchlistResult>> {
+    const body = options.items ? { ...options, items: options.items.map(normalizeItem) } : options;
+    return this.postJson("/watchlists", body, requestOptions);
+  }
+
+  /** One page of your watchlists. */
+  async listWatchlists(
+    options: CursorListOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<Watchlist>> {
+    return this.request<CursorListResponse<Watchlist>>({
+      method: "GET",
+      path: "/watchlists",
+      query: { cursor: options.cursor, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Walks `listWatchlists`, yielding one page at a time until the last. */
+  iterWatchlists(options: CursorListOptions = {}): AsyncGenerator<Watchlist[], void, unknown> {
+    return this.iterCursor("iterWatchlists", options, (o) => this.listWatchlists(o), false);
+  }
+
+  async getWatchlist(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<Watchlist>> {
+    return this.request<ApiResponse<Watchlist>>({
+      method: "GET",
+      path: `/watchlists/${encodeURIComponent(id)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Renames a watchlist and/or replaces its metadata. */
+  async updateWatchlist(
+    id: string,
+    options: UpdateWatchlistOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<Watchlist>> {
+    return this.request<ApiResponse<Watchlist>>({
+      method: "PATCH",
+      path: `/watchlists/${encodeURIComponent(id)}`,
+      body: options,
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+    });
+  }
+
+  /** Deletes a watchlist and its items. Events already emitted stay readable in `listChanges`. */
+  async deleteWatchlist(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<DeleteResult>> {
+    return this.deleteRequest(`/watchlists/${encodeURIComponent(id)}`, requestOptions);
+  }
+
+  /**
+   * Adds 1 to 100 CNRs to a watchlist. Each gets a result in `data.results`:
+   * `watching`, `pending` (not in the corpus yet, so a live fetch was
+   * started), `invalid`, `duplicate`, `cap_exceeded` or `not_found`.
+   */
+  async addWatchlistItems(
+    id: string,
+    items: WatchlistItemInput[],
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<AddWatchlistItemsResult>> {
+    return this.postJson(`/watchlists/${encodeURIComponent(id)}/items`, { items: items.map(normalizeItem) }, requestOptions);
+  }
+
+  /** One page of the CNRs in a watchlist, optionally filtered by `status`. */
+  async listWatchlistItems(
+    id: string,
+    options: ListWatchlistItemsOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<WatchlistItem>> {
+    return this.request<CursorListResponse<WatchlistItem>>({
+      method: "GET",
+      path: `/watchlists/${encodeURIComponent(id)}/items`,
+      query: { cursor: options.cursor, limit: options.limit, status: options.status },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Walks `listWatchlistItems`, yielding one page at a time until the last. */
+  iterWatchlistItems(id: string, options: ListWatchlistItemsOptions = {}): AsyncGenerator<WatchlistItem[], void, unknown> {
+    return this.iterCursor("iterWatchlistItems", options, (o) => this.listWatchlistItems(id, o), false);
+  }
+
+  /** Stops watching one CNR in one watchlist. */
+  async removeWatchlistItem(id: string, cnr: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<DeleteResult>> {
+    return this.deleteRequest(
+      `/watchlists/${encodeURIComponent(id)}/items/${encodeURIComponent(cnrForRequest(cnr))}`,
+      requestOptions,
+    );
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Change feed                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * One page of change events across all your watchlists, oldest first.
+   * 1 credit per non-empty page of up to 100 events; an empty page is free.
+   *
+   * `pagination.nextCursor` is always returned, even on an empty page, so
+   * you can store it and poll forward forever: pass it back as `cursor` on
+   * the next poll. Events are kept for 90 days. Delivery is at least once
+   * across webhooks, so dedupe on `event.id`.
+   */
+  async listChanges(
+    options: ListChangesOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<ChangeEvent>> {
+    return this.request<CursorListResponse<ChangeEvent>>({
+      method: "GET",
+      path: "/changes",
+      query: changesQuery(options),
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `listChanges` until it is caught up, yielding one page of events
+   * at a time. Stops at the first empty page (which is free). To keep a
+   * durable position between runs, call `listChanges` yourself and store
+   * `pagination.nextCursor`.
+   */
+  iterChanges(options: ListChangesOptions = {}): AsyncGenerator<ChangeEvent[], void, unknown> {
+    return this.iterCursor("iterChanges", options, (o) => this.listChanges(o), true);
+  }
+
+  /** Same as `listChanges`, filtered to one watchlist. Same pricing. */
+  async listWatchlistEvents(
+    id: string,
+    options: ListChangesOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<ChangeEvent>> {
+    return this.request<CursorListResponse<ChangeEvent>>({
+      method: "GET",
+      path: `/watchlists/${encodeURIComponent(id)}/events`,
+      query: changesQuery(options),
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Walks `listWatchlistEvents` until caught up. See `iterChanges`. */
+  iterWatchlistEvents(id: string, options: ListChangesOptions = {}): AsyncGenerator<ChangeEvent[], void, unknown> {
+    return this.iterCursor("iterWatchlistEvents", options, (o) => this.listWatchlistEvents(id, o), true);
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Webhooks                                                               */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Registers a webhook endpoint (https only). The returned `secret` is
+   * shown once, here and on `rotateWebhookSecret`: store it. Use it with
+   * `verifyWebhookSignature`.
+   */
+  async createWebhook(
+    options: CreateWebhookOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<WebhookWithSecret>> {
+    return this.postJson("/webhooks", options, requestOptions);
+  }
+
+  async listWebhooks(
+    options: CursorListOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<Webhook>> {
+    return this.request<CursorListResponse<Webhook>>({
+      method: "GET",
+      path: "/webhooks",
+      query: { cursor: options.cursor, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Walks `listWebhooks`, yielding one page at a time until the last. */
+  iterWebhooks(options: CursorListOptions = {}): AsyncGenerator<Webhook[], void, unknown> {
+    return this.iterCursor("iterWebhooks", options, (o) => this.listWebhooks(o), false);
+  }
+
+  /** Never returns the secret. */
+  async getWebhook(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<Webhook>> {
+    return this.request<ApiResponse<Webhook>>({
+      method: "GET",
+      path: `/webhooks/${encodeURIComponent(id)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Changes the URL, event filter, watchlist filter, description, or re-enables a disabled endpoint with `enabled: true`. */
+  async updateWebhook(
+    id: string,
+    options: UpdateWebhookOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<Webhook>> {
+    return this.request<ApiResponse<Webhook>>({
+      method: "PATCH",
+      path: `/webhooks/${encodeURIComponent(id)}`,
+      body: options,
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+    });
+  }
+
+  async deleteWebhook(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<DeleteResult>> {
+    return this.deleteRequest(`/webhooks/${encodeURIComponent(id)}`, requestOptions);
+  }
+
+  /**
+   * Issues a new signing secret. The old secret keeps signing in parallel
+   * for 24 hours (deliveries then carry two `v1=` signatures), so you can
+   * switch over without dropping events.
+   */
+  async rotateWebhookSecret(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<WebhookWithSecret>> {
+    return this.postJson(`/webhooks/${encodeURIComponent(id)}/rotate-secret`, undefined, requestOptions);
+  }
+
+  /** Sends a `webhook.test` event to the endpoint now and returns the delivery attempt result. */
+  async testWebhook(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<WebhookDelivery>> {
+    return this.postJson(`/webhooks/${encodeURIComponent(id)}/test`, undefined, requestOptions);
+  }
+
+  /** One page of delivery attempts for an endpoint. */
+  async listWebhookDeliveries(
+    id: string,
+    options: CursorListOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CursorListResponse<WebhookDelivery>> {
+    return this.request<CursorListResponse<WebhookDelivery>>({
+      method: "GET",
+      path: `/webhooks/${encodeURIComponent(id)}/deliveries`,
+      query: { cursor: options.cursor, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /** Walks `listWebhookDeliveries`, yielding one page at a time until the last. */
+  iterWebhookDeliveries(id: string, options: CursorListOptions = {}): AsyncGenerator<WebhookDelivery[], void, unknown> {
+    return this.iterCursor("iterWebhookDeliveries", options, (o) => this.listWebhookDeliveries(id, o), false);
+  }
+
+  /** Re-queues one delivery to be sent now. */
+  async retryWebhookDelivery(
+    id: string,
+    deliveryId: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<WebhookDelivery>> {
+    return this.postJson(
+      `/webhooks/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/retry`,
+      undefined,
+      requestOptions,
+    );
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
+
+  private postJson<T>(path: string, body: unknown, requestOptions: RequestConfig): Promise<T> {
+    return this.request<T>({
+      method: "POST",
+      path,
+      body,
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
+    });
+  }
+
+  /** DELETE; some servers answer 204 with no body, so an empty reply becomes `{ success: true, data: { deleted: true } }`. */
+  private async deleteRequest(path: string, requestOptions: RequestConfig): Promise<ApiResponse<DeleteResult>> {
+    const json = await this.request<ApiResponse<DeleteResult> | undefined>({
+      method: "DELETE",
+      path,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+    return json ?? { success: true, data: { deleted: true } };
+  }
+
+  /**
+   * Shared cursor walker. `stopOnEmpty` is the change feed rule: an empty
+   * page means caught up. Other lists stop when there is no `nextCursor`.
+   */
+  private async *iterCursor<T, O extends CursorListOptions>(
+    name: string,
+    options: O,
+    fetchPage: (o: O) => Promise<CursorListResponse<T>>,
+    stopOnEmpty: boolean,
+  ): AsyncGenerator<T[], void, unknown> {
+    let cursor = options.cursor;
+    for (let i = 0; i < MAX_ITERATOR_PAGES; i++) {
+      const response = await fetchPage({ ...options, cursor });
+      const data = response.data ?? [];
+      if (data.length === 0 && stopOnEmpty) return;
+      if (data.length > 0) yield data;
+      const next = response.pagination?.nextCursor;
+      if (typeof next !== "string" || next.length === 0 || next === cursor) return;
+      if (!stopOnEmpty && response.pagination?.hasMore === false) return;
+      cursor = next;
+    }
+    throw new Error(
+      `${name} exceeded the safety guard of ${MAX_ITERATOR_PAGES} pages. This usually means ` +
+        "the server keeps returning a new cursor without making progress.",
+    );
+  }
 
   private buildUrl(path: string, query?: Record<string, string | number | boolean | undefined>): string {
     const url = new URL(this.baseUrl + path);
@@ -829,7 +1217,10 @@ export class CourtMeshClient {
     // error, a read timeout, or a 502/503/504 response) when this call, or
     // the client, opted in. A 429 is not gated by this - see below, it is a
     // pre-flight refusal, not evidence the request was ever processed.
-    const canRetryAfterDispatch = opts.method === "GET" || (opts.retryPosts ?? this.retryPosts);
+    // GET and DELETE are idempotent, so they are retried by default; POST and
+    // PATCH are retried only on opt-in.
+    const canRetryAfterDispatch =
+      opts.method === "GET" || opts.method === "DELETE" || (opts.retryPosts ?? this.retryPosts);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();

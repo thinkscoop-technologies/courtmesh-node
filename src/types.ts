@@ -109,8 +109,14 @@ export interface SearchJudgesMeta {
 /* -------------------------------------------------------------------------- */
 
 export interface SearchCasesOptions {
-  /** Required, trimmed, minimum length 1. */
-  query: string;
+  /** Trimmed, minimum length 1. Required unless `cnr` is given. */
+  query?: string;
+  /**
+   * Exact CNR match (no fuzzy text matching). Any common spelling is
+   * accepted and normalised to the canonical 16 characters before sending.
+   * When present, `query` is optional.
+   */
+  cnr?: string;
   court?: StringOrArray;
   /** Int must be 1947..current year. */
   year?: YearParam;
@@ -610,9 +616,9 @@ export interface OrderDocument {
 export interface RequestTimelineOptions {
   /**
    * Force a live fetch from the court portal instead of serving the last
-   * stored read. Default false. Costs 20 credits when it actually triggers
-   * live work, versus 1 credit for a stored read - see `meta.liveFetch` on
-   * the response to see which one happened. Not available on the Free tier
+   * stored read. Default false. Costs 1 credit, the same as a stored read
+   * (it was 20 before 0.5.0); `meta.liveFetch` on the response says
+   * whether live work actually happened. Not available on the Free tier
    * (`LIVE_FETCH_NOT_ALLOWED`, 403) and capped per day per tier
    * (`LIVE_FETCH_LIMIT_REACHED`, 429).
    */

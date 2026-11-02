@@ -1,9 +1,17 @@
 {
   "name": "@courtmesh/sdk",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Official TypeScript SDK for the CourtMesh API.",
   "license": "MIT",
   "author": "Thinkscoop Technologies LLP",
+  "homepage": "https://research.courtmesh.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkscoop-technologies/courtmesh-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thinkscoop-technologies/courtmesh-node/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -16,7 +24,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "sideEffects": false,
   "engines": {
@@ -25,7 +34,8 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "keywords": [
     "courtmesh",
