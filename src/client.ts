@@ -143,8 +143,9 @@ export interface RequestConfig {
    * Only meaningful on the POST methods that accept an `Idempotency-Key`
    * header: `screenParty`, `screenPartyBatch`, `analyzeCase`,
    * `analyzeConsolidated`, `requestTimeline`, `createWatchlist`,
-   * `addWatchlistItems`, `createWebhook`, `rotateWebhookSecret`,
-   * `testWebhook` and `retryWebhookDelivery`. 1 to 128 characters,
+   * `addWatchlistItems`. (The webhook POST methods `createWebhook`,
+   * `rotateWebhookSecret`, `testWebhook` and `retryWebhookDelivery` accept
+   * the option too, but the server does not deduplicate them.) 1 to 128 characters,
    * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
    * the same key and the same body returns the stored 2xx response again
    * (`response.replayed` is then `true`) with no new charge; the same key
@@ -834,13 +835,18 @@ export class CourtMeshClient {
    * 1 credit, charged only when a record is returned.
    *
    * `data.status` is `found` (200, `data.case` holds the record), or
-   * `pending` (202, a live fetch is running: poll this same call, or
-   * `getTimeline(data.requestId)`). A CNR that is not in the corpus and was
-   * not fetched throws `NotFoundError` (`apiCode === "CASE_NOT_FOUND"`).
+   * `pending` (202, a live fetch is running: poll this same call with the
+   * same CNR; `data.requestId` is opaque and is not accepted by
+   * `getTimeline`). A CNR that is not in the corpus and was not fetched
+   * throws `NotFoundError` (`apiCode === "CASE_NOT_FOUND"`). A Supreme Court
+   * CNR that is not in the corpus cannot be fetched live and throws it
+   * straight away.
    *
    * Pass `{ fetch: true }` to start a live court portal fetch for a CNR we
-   * do not hold yet: 1 credit once the fetch is accepted, sharing the daily
-   * live fetch cap with `requestTimeline({ refresh: true })`.
+   * do not hold yet. The call that starts the fetch returns `pending` and is
+   * free; the poll that returns the record is the one 1 credit charge, and a
+   * fetch the court portal cannot satisfy costs nothing. Fetches share the
+   * daily live fetch cap with `requestTimeline({ refresh: true })`.
    */
   async getCaseByCnr(
     cnr: string,
@@ -1082,7 +1088,7 @@ export class CourtMeshClient {
     return this.postJson(`/webhooks/${encodeURIComponent(id)}/rotate-secret`, undefined, requestOptions);
   }
 
-  /** Sends a `webhook.test` event to the endpoint now and returns the delivery attempt result. */
+  /** Sends a `webhook.test` event to the endpoint now (a single attempt, never retried) and returns the delivery object. */
   async testWebhook(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<WebhookDelivery>> {
     return this.postJson(`/webhooks/${encodeURIComponent(id)}/test`, undefined, requestOptions);
   }

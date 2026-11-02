@@ -373,6 +373,19 @@ export interface CaseDetails {
   respondents?: string[];
   decisionDate?: string;
   disposalNature?: string;
+  /** Canonical 16 character CNR when the court published one. */
+  cnr?: string;
+  courtName?: string;
+  courtType?: string;
+  caseYear?: number | string;
+  registrationDate?: string;
+  /** Where the case stands, for example "Pending" or "Disposed". */
+  caseStatus?: string;
+  caseStage?: string;
+  /** YYYY-MM-DD. */
+  nextHearingDate?: string;
+  lastListedOn?: string;
+  orderCount?: number;
   summary?: string;
   metadata?: { diaryNumber?: string };
   hasDocuments?: boolean;

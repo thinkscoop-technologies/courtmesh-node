@@ -19,7 +19,7 @@ const CNR_PATTERN = /^[A-Z]{2}[A-Z0-9]{4}[0-9]{10}$/;
 /**
  * Normalises a CNR the way the server does: trims, uppercases, removes
  * spaces, hyphens, slashes, dots and colons, and drops a leading `CNR`,
- * `CNR:` or `CNR NO` label. Returns the canonical 16 character form, or
+ * `CNR:`, `CNR NO` or `CNR NUMBER` label. Returns the canonical 16 character form, or
  * `null` when the input cannot be a CNR.
  *
  * The server is the authority; this exists so you can validate input before
@@ -32,7 +32,8 @@ export function normalizeCnr(input: unknown): string | null {
   if (typeof input !== "string") return null;
   let value = input.trim().toUpperCase().replace(/[\s\-/.:]+/g, "");
   if (!CNR_PATTERN.test(value)) {
-    if (value.startsWith("CNRNO")) value = value.slice(5);
+    if (value.startsWith("CNRNUMBER")) value = value.slice(9);
+    else if (value.startsWith("CNRNO")) value = value.slice(5);
     else if (value.startsWith("CNR")) value = value.slice(3);
   }
   return CNR_PATTERN.test(value) ? value : null;
@@ -82,12 +83,14 @@ export interface CursorListOptions {
 export interface GetCaseByCnrOptions {
   /**
    * When the CNR is not in the corpus, start a live court portal fetch.
-   * Costs 1 credit, charged once when the fetch is accepted, and counts
-   * against the same daily live fetch cap as a timeline refresh.
+   * The call that starts it returns `pending` and is free; the poll that
+   * returns the record is the single 1 credit charge, and a failed fetch is
+   * free. Counts against the same daily live fetch cap as a timeline refresh.
    */
   fetch?: boolean;
 }
 
+/** `not_found` is never returned in a 200 body: it surfaces as `NotFoundError` (`CASE_NOT_FOUND`). */
 export type CnrLookupStatus = "found" | "pending" | "not_found";
 
 export interface CnrLookupData {
@@ -96,7 +99,7 @@ export interface CnrLookupData {
   status: CnrLookupStatus;
   /** Present when `status` is `found`, same shape as `GET /cases/{id}`. */
   case?: Record<string, unknown> | null;
-  /** Present when `status` is `pending`. Poll the same call, or `getTimeline(requestId)`. */
+  /** Present when `status` is `pending`. Opaque: poll the same `getCaseByCnr` call; it is not accepted by `getTimeline`. */
   requestId?: string | null;
 }
 
@@ -263,6 +266,8 @@ export interface Webhook {
   description?: string | null;
   enabled: boolean;
   disabledReason?: string | null;
+  /** True for 24 hours after a secret rotation, while both secrets sign. */
+  secretRotating?: boolean;
   createdAt: string;
   updatedAt?: string;
 }

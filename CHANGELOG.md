@@ -25,6 +25,9 @@ Adds CNR lookup and case monitoring (API docs 1.3.0).
 
 ### Changed
 
+- `getCaseByCnr` with `fetch: true`: the call that starts the fetch returns `pending` and is free; the poll that returns the record is the one 1 credit charge. `requestId` is opaque and is polled via the same call, not `getTimeline`.
+- New error codes typed: `ITEM_NOT_FOUND` (removing a CNR not in the list) and the other monitoring codes.
+- `Webhook.secretRotating`.
 - `requestTimeline({ refresh: true })` now costs 1 credit (it was 20). Docs and docstrings updated.
 - `SearchCasesOptions.query` is optional (required unless `cnr` is set).
 - `User-Agent` is `courtmesh-node/0.5.0`.
