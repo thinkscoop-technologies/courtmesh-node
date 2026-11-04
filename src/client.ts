@@ -53,6 +53,22 @@ import type {
 } from "./types.js";
 import { normalizeCnr } from "./monitoring.js";
 import type {
+  ActHistoryResponse,
+  ActResolutionResponse,
+  ActResponse,
+  ActSectionResponse,
+  CitingCase,
+  CitingCasesResponse,
+  ListActSectionsOptions,
+  ListActSectionsResponse,
+  ListSectionCitingCasesOptions,
+  SearchActsOptions,
+  SearchActsResponse,
+  SearchSectionsOptions,
+  SearchSectionsResponse,
+  SectionLookupResponse,
+} from "./acts.js";
+import type {
   AddWatchlistItemsResult,
   ChangeEvent,
   CnrLookupData,
@@ -82,7 +98,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.5.0";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.6.0";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 
@@ -1137,6 +1153,186 @@ export class CourtMeshClient {
       undefined,
       requestOptions,
     );
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Acts and sections (needs the `legislation` scope)                      */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Finds acts by title, short form or subject, `GET /acts/search`. 1 credit
+   * when something is returned, nothing when nothing is. `pagination.total`
+   * counts matches before unpublished records are removed, so a page can hold
+   * fewer rows than `limit`. `meta.weakMatch` is true when nothing matched
+   * closely. Check `repealed` on each act before relying on it.
+   */
+  async searchActs(options: SearchActsOptions, requestOptions: RequestConfig = {}): Promise<SearchActsResponse> {
+    return this.request<SearchActsResponse>({
+      method: "GET",
+      path: "/acts/search",
+      query: {
+        q: options.query,
+        docClass: options.docClass,
+        jurisdiction: options.jurisdiction,
+        yearFrom: options.yearFrom,
+        yearTo: options.yearTo,
+        page: options.page,
+        limit: options.limit,
+      },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Turns what a lawyer writes ("IPC", "NI Act") into the act,
+   * `GET /acts/resolve`. Returns up to five candidates, best first. Same
+   * pricing as `searchActs`.
+   */
+  async resolveAct(query: string, requestOptions: RequestConfig = {}): Promise<ActResolutionResponse> {
+    return this.request<ActResolutionResponse>({
+      method: "GET",
+      path: "/acts/resolve",
+      query: { q: query },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * One act's details and repeal status, without its text,
+   * `GET /acts/{slug}`. An unknown slug throws `NotFoundError` with
+   * `apiCode === "ACT_NOT_FOUND"` and costs nothing. 1 credit otherwise.
+   */
+  async getAct(slug: string, requestOptions: RequestConfig = {}): Promise<ActResponse> {
+    return this.request<ActResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * What repealed an act and what amended it, `GET /acts/{slug}/history`.
+   * This is act level only: it does not map old sections to new ones. An
+   * unknown slug throws `NotFoundError` (`ACT_NOT_FOUND`). 1 credit.
+   */
+  async getActHistory(slug: string, requestOptions: RequestConfig = {}): Promise<ActHistoryResponse> {
+    return this.request<ActHistoryResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/history`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * The provisions of an act in order, without their text,
+   * `GET /acts/{slug}/sections`. An act published only as one document has
+   * none (see `textSource` on `getAct`). An unknown slug throws
+   * `NotFoundError` (`ACT_NOT_FOUND`). 1 credit when rows come back.
+   */
+  async listActSections(
+    slug: string,
+    options: ListActSectionsOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<ListActSectionsResponse> {
+    return this.request<ListActSectionsResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections`,
+      query: { page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * One provision's full text, structured into blocks, with its amendment
+   * notes and repeal status, `GET /acts/{slug}/sections/{sectionSlug}`. An
+   * unknown act or provision throws `NotFoundError` with
+   * `apiCode === "SECTION_NOT_FOUND"`, at no charge. 1 credit otherwise.
+   */
+  async getActSection(slug: string, sectionSlug: string, requestOptions: RequestConfig = {}): Promise<ActSectionResponse> {
+    return this.request<ActSectionResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections/${encodeURIComponent(sectionSlug)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Judgments citing exactly this provision, newest first,
+   * `GET /acts/{slug}/sections/{sectionSlug}/citing-cases`. A search for
+   * section 302 of the Penal Code does not return judgments that cite only
+   * its successor.
+   *
+   * This is not an exhaustive list of every judgment applying the provision,
+   * and an empty list does not mean no judgment applied it. `listAvailable`
+   * is false for a provision judgments cannot be listed for. Withheld matters
+   * are left out (`meta.someRecordsWithheld`); if that check could not run,
+   * titles are masked (`meta.restrictedCheckDegraded`). Read a judgment with
+   * `getCase(id)`. A temporary failure throws `BadGatewayError`
+   * (`UPSTREAM_UNAVAILABLE`), is free and is safe to retry. 1 credit when
+   * cases come back.
+   */
+  async listSectionCitingCases(
+    slug: string,
+    sectionSlug: string,
+    options: ListSectionCitingCasesOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CitingCasesResponse> {
+    return this.request<CitingCasesResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections/${encodeURIComponent(sectionSlug)}/citing-cases`,
+      query: { cursor: options.cursor, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `listSectionCitingCases`, yielding one page of judgments at a time
+   * until the last. The same caveats apply: the list is not exhaustive.
+   */
+  iterSectionCitingCases(
+    slug: string,
+    sectionSlug: string,
+    options: ListSectionCitingCasesOptions = {},
+  ): AsyncGenerator<CitingCase[], void, unknown> {
+    return this.iterCursor(
+      "iterSectionCitingCases",
+      options,
+      async (o) => {
+        const res = await this.listSectionCitingCases(slug, sectionSlug, o);
+        return { success: true as const, data: res.data.cases, pagination: res.pagination };
+      },
+      false,
+    );
+  }
+
+  /**
+   * Full text search across provisions, with a short snippet per row,
+   * `GET /sections/search`. Narrow it with `act` (a slug) or `number`. Same
+   * pricing and `pagination.total` caveat as `searchActs`.
+   */
+  async searchSections(options: SearchSectionsOptions, requestOptions: RequestConfig = {}): Promise<SearchSectionsResponse> {
+    return this.request<SearchSectionsResponse>({
+      method: "GET",
+      path: "/sections/search",
+      query: { q: options.query, act: options.act, number: options.number, page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Turns shorthand such as "section 302 IPC", "s.138 NI Act" or "Article 21"
+   * into the provision it names, `GET /sections/lookup`. A lettered section
+   * keeps its letter. "Order VII Rule 11 CPC" is not resolved and returns no
+   * match. `ambiguous` is true on a match when no act was named: choose or
+   * name the act. 1 credit when something is returned.
+   */
+  async lookupSection(citation: string, requestOptions: RequestConfig = {}): Promise<SectionLookupResponse> {
+    return this.request<SectionLookupResponse>({
+      method: "GET",
+      path: "/sections/lookup",
+      query: { q: citation },
+      timeoutMs: requestOptions.timeoutMs,
+    });
   }
 
   /* ---------------------------------------------------------------------- */

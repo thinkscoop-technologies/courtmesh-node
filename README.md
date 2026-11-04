@@ -372,6 +372,35 @@ Each attempt has a 10 second deadline and reads at most 64 KB of your response. 
 
 Watch caps per account (distinct CNRs across all watchlists, so the same CNR on two lists uses one slot): Free 10, Pay As You Go 1,000, Scale 10,000, Enterprise by contract. Two daily limits apply to adding, counted per Indian calendar day, and items over either come back as `cap_exceeded` with a message: every add that results in a watched or pending item counts toward a daily add allowance (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000), and adding CNRs we do not hold yet starts a live fetch, so those also have their own daily limit (Free 20, Pay As You Go 500, Scale 5,000, Enterprise unlimited). A Supreme Court CNR we do not hold comes back `not_found` at once. If the court portal had nothing for a CNR in the last 24 hours, adding it again is `not_found` with a message and starts no new fetch (the same cooldown makes `getCaseByCnr(..., { fetch: true })` throw `NotFoundError`). `not_found`, `error` and `unavailable` items still count toward the cap until removed. At most 50 watchlists and 10 webhook endpoints per account. `WATCH_CAP_EXCEEDED` (403) is thrown only when the cap is already full and you sent a new CNR. Webhook delivery history is kept 30 days and events 90 days; an event appears in the feed about 2 seconds after it is created. New error codes surface as typed errors with `apiCode` set: `INVALID_CNR`, `WATCHLIST_NOT_FOUND`, `WEBHOOK_NOT_FOUND`, `DELIVERY_NOT_FOUND`, `WATCH_CAP_EXCEEDED`, `WATCHLIST_LIMIT_REACHED`, `WEBHOOK_LIMIT_REACHED`, `INVALID_WEBHOOK_URL`, `ITEM_NOT_FOUND` (removing a CNR that is not in the list). API keys need the `monitoring:read` and `monitoring:write` scopes (keys without explicit scopes have full access).
 
+## Acts and sections
+
+Read Indian statutes: find an act, read a provision with its amendment notes, follow what replaced a repealed law, and list judgments that cite a provision. These calls need the `legislation` scope. Each costs 1 credit when it returns something and nothing when it returns nothing. Text is the statute as published. Repeal status is on every act and provision, so check `repealed` (acts) and `actRepealed` or `repealedProvision` (provisions) before relying on one.
+
+```ts
+import { CourtMeshClient } from "@courtmesh/sdk";
+
+const client = new CourtMeshClient({ apiKey: process.env.COURTMESH_API_KEY });
+
+// "section 302 IPC" to the provision it names. A lettered section keeps its letter.
+const found = await client.lookupSection("section 302 IPC");
+const { section, ambiguous } = found.data.matches[0]!; // ambiguous is true when no act was named
+console.log(section.actRepealed, section.actRepealNote);
+
+// The full text, then judgments citing exactly this provision.
+const text = await client.getActSection(section.actSlug, section.slug);
+console.log(text.data.text);
+
+for await (const page of client.iterSectionCitingCases(section.actSlug, section.slug)) {
+  for (const c of page) console.log(c.id, c.title, c.decisionDate);
+}
+```
+
+Methods: `searchActs`, `resolveAct`, `getAct`, `getActHistory`, `listActSections`, `getActSection`, `listSectionCitingCases` (with the `iterSectionCitingCases` generator), `searchSections`, `lookupSection`.
+
+The citing list is not exhaustive: an empty list does not mean no judgment applied the provision, and `listAvailable: false` means judgments cannot be listed for that provision. It matches the exact provision only, so a search for section 302 of the Penal Code does not return judgments that cite only its successor. Withheld matters are left out and `meta.someRecordsWithheld` says so. `getActHistory` is at act level: it lists what repealed an act and what amended it, and does not map old sections to new ones. "Order VII Rule 11 CPC" style citations are not resolved by `lookupSection` and return no match.
+
+An unknown act slug throws `NotFoundError` with `apiCode` `ACT_NOT_FOUND`, and an unknown provision throws it with `SECTION_NOT_FOUND`. Neither is charged. A temporary failure listing citing judgments throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`); it is free and safe to retry.
+
 ## Pagination
 
 `iterSearchCases` and `iterSemanticSearch` are async generators that walk pages automatically, yielding one page of results at a time. They stop when a page comes back empty, or when `pagination.hasMore` is false. Both have a built in safety guard of 10000 pages to prevent runaway loops. Default page size is 20 for both (also the Free tier's own `maxPageSize`; do not request more than your tier allows, see `PAGE_LIMIT_EXCEEDED` below).
@@ -441,7 +470,7 @@ try {
 | `AuthenticationError` | 401 | missing, malformed, unknown, revoked or expired API key (`apiCode`: `API_KEY_MISSING`, `API_KEY_INVALID_FORMAT`, `API_KEY_INVALID`, `API_KEY_REVOKED`, `API_KEY_EXPIRED`) |
 | `InsufficientCreditsError` | 402 | every priced endpoint pre-flight reserves the charge before doing any work; `required`, `balance`, `shortfall`, `wallet`, `walletOwner` (`"user"` \| `"org"`), and either `topUpUrl` or `contactAdmin: true` (never both) |
 | `PermissionError` | 403 | org/account state, a plan limit (`callsToday`/`maxAllowed`), or a tier/feature restriction (`apiCode`/`upgradeUrl`/`tier`, for example `API_NOT_AVAILABLE_ON_TRIAL`, `API_TIER_NOT_ALLOWED`, `SEMANTIC_NOT_ALLOWED`, `LIVE_FETCH_NOT_ALLOWED`, `REMOTE_FETCH_NOT_ALLOWED`, `PARTY_SCREEN_LIMIT_REACHED`) |
-| `NotFoundError` | 404 | `apiCode`: `CASE_NOT_FOUND` or `PDF_NOT_STORED` on the pdf endpoint |
+| `NotFoundError` | 404 | `apiCode`: `CASE_NOT_FOUND` or `PDF_NOT_STORED` on the pdf endpoint; `ACT_NOT_FOUND` or `SECTION_NOT_FOUND` on the acts endpoints |
 | `RequestTimeoutError` | 408 | server side OpenSearch timeout, or the SDK's own client side timeout |
 | `RateLimitError` | 429 | `retryAfter`/`retryAfterSeconds` (seconds), `resetTime` (ISO string), and `apiCode` (`RATE_LIMITED`, `CONCURRENT_ANALYSIS_LIMIT`, or a daily/monthly cap code like `DISTINCT_NAMES_LIMIT_REACHED`) |
 | `ServerError` | 500 | |

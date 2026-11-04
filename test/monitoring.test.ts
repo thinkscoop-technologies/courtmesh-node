@@ -319,10 +319,10 @@ describe("HTTP layer", () => {
     expect(patch.calls).toHaveLength(1);
   });
 
-  it("sends the 0.5.0 user agent", async () => {
+  it("sends the 0.6.0 user agent", async () => {
     const { client, calls } = makeClient([ok({ id: "wh_1" })]);
     await client.getWebhook("wh_1");
-    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.5.0");
+    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.6.0");
   });
 });
 
