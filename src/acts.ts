@@ -239,25 +239,18 @@ export interface CitingCase {
 /**
  * Judgments citing exactly one provision, newest first. This is not an
  * exhaustive list of every judgment applying the provision, and an empty
- * list does not mean no judgment applied it.
+ * list does not mean no judgment applied it. Some matters are never listed.
  */
 export interface CitingCases {
   section: { actSlug: string; slug: string; number?: string | null };
-  /** False when judgments cannot be listed for this provision. That says nothing about whether any exist. */
+  /**
+   * False for a provision we do not list judgments for, including sexual
+   * offences and cruelty provisions. That says nothing about whether any exist.
+   */
   listAvailable: boolean;
   note: string;
-  /** Citing judgments found, before any are withheld. */
-  total: number;
-  /** True when there are at least `total`. */
-  totalIsLowerBound: boolean;
+  /** A page can hold fewer rows than `limit`, or none, while `pagination.hasMore` is true. Keep following `nextCursor`. */
   cases: CitingCase[];
-}
-
-export interface CitingCasesMeta extends ActsListMeta {
-  /** True when some matters were left out because they are withheld. */
-  someRecordsWithheld?: boolean;
-  /** True when the withheld check could not run, in which case titles are masked. */
-  restrictedCheckDegraded?: boolean;
 }
 
 export type CitingCasesPagination = CursorPagination & { hasMore: boolean; limit: number };
@@ -265,7 +258,7 @@ export type CitingCasesPagination = CursorPagination & { hasMore: boolean; limit
 export interface CitingCasesResponse {
   success: true;
   data: CitingCases;
-  meta?: CitingCasesMeta;
+  meta?: ActsListMeta;
   pagination: CitingCasesPagination;
   requestId?: string;
 }

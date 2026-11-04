@@ -198,7 +198,6 @@ export type {
   ListSectionCitingCasesOptions,
   CitingCase,
   CitingCases,
-  CitingCasesMeta,
   CitingCasesPagination,
   CitingCasesResponse,
   ActResponse,

@@ -397,9 +397,9 @@ for await (const page of client.iterSectionCitingCases(section.actSlug, section.
 
 Methods: `searchActs`, `resolveAct`, `getAct`, `getActHistory`, `listActSections`, `getActSection`, `listSectionCitingCases` (with the `iterSectionCitingCases` generator), `searchSections`, `lookupSection`.
 
-The citing list is not exhaustive: an empty list does not mean no judgment applied the provision, and `listAvailable: false` means judgments cannot be listed for that provision. It matches the exact provision only, so a search for section 302 of the Penal Code does not return judgments that cite only its successor. Withheld matters are left out and `meta.someRecordsWithheld` says so. `getActHistory` is at act level: it lists what repealed an act and what amended it, and does not map old sections to new ones. "Order VII Rule 11 CPC" style citations are not resolved by `lookupSection` and return no match.
+The citing list is not exhaustive: an empty list does not mean no judgment applied the provision, and `listAvailable: false` means judgments cannot be listed for that provision. It matches the exact provision only, so a search for section 302 of the Penal Code does not return judgments that cite only its successor. Some matters are never listed: `listAvailable` is false for a provision we do not list judgments for, including sexual offences and cruelty provisions. A page can hold fewer rows than `limit`, or none, while `pagination.hasMore` is true, so keep following `pagination.nextCursor` (it is opaque); `iterSectionCitingCases` does this for you. `getActHistory` is at act level: it lists what repealed an act and what amended it, and does not map old sections to new ones. "Order VII Rule 11 CPC" style citations are not resolved by `lookupSection` and return no match.
 
-An unknown act slug throws `NotFoundError` with `apiCode` `ACT_NOT_FOUND`, and an unknown provision throws it with `SECTION_NOT_FOUND`. Neither is charged. A temporary failure listing citing judgments throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`); it is free and safe to retry.
+An unknown act slug throws `NotFoundError` with `apiCode` `ACT_NOT_FOUND`, and an unknown provision throws it with `SECTION_NOT_FOUND`. Neither is charged. A temporary failure listing citing judgments throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`); it is free and safe to retry. `searchActs`, `resolveAct`, `searchSections` and `lookupSection` have a lower per minute limit than other calls and are refused with 429 (`RateLimitError`) above it.
 
 ## Pagination
 
@@ -471,7 +471,7 @@ try {
 | `InsufficientCreditsError` | 402 | every priced endpoint pre-flight reserves the charge before doing any work; `required`, `balance`, `shortfall`, `wallet`, `walletOwner` (`"user"` \| `"org"`), and either `topUpUrl` or `contactAdmin: true` (never both) |
 | `PermissionError` | 403 | org/account state, a plan limit (`callsToday`/`maxAllowed`), or a tier/feature restriction (`apiCode`/`upgradeUrl`/`tier`, for example `API_NOT_AVAILABLE_ON_TRIAL`, `API_TIER_NOT_ALLOWED`, `SEMANTIC_NOT_ALLOWED`, `LIVE_FETCH_NOT_ALLOWED`, `REMOTE_FETCH_NOT_ALLOWED`, `PARTY_SCREEN_LIMIT_REACHED`) |
 | `NotFoundError` | 404 | `apiCode`: `CASE_NOT_FOUND` or `PDF_NOT_STORED` on the pdf endpoint; `ACT_NOT_FOUND` or `SECTION_NOT_FOUND` on the acts endpoints |
-| `RequestTimeoutError` | 408 | server side OpenSearch timeout, or the SDK's own client side timeout |
+| `RequestTimeoutError` | 408 | the server took too long to answer, or the SDK's own client side timeout |
 | `RateLimitError` | 429 | `retryAfter`/`retryAfterSeconds` (seconds), `resetTime` (ISO string), and `apiCode` (`RATE_LIMITED`, `CONCURRENT_ANALYSIS_LIMIT`, or a daily/monthly cap code like `DISTINCT_NAMES_LIMIT_REACHED`) |
 | `ServerError` | 500 | |
 | `BadGatewayError` | 502 | also `PARTY_SCREEN_SEARCH_DEGRADED` - the underlying case search itself errored and returned nothing usable, retry |

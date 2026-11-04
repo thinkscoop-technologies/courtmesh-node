@@ -122,18 +122,17 @@ describe("listSectionCitingCases", () => {
   const caseRow = (id: string) => ({ id, title: "State v. Example", court: "Delhi High Court", cnr: "DLHC010084212021", decisionDate: "2024-05-06" });
   const body = (ids: string[], nextCursor: string | null) => ({
     section: { actSlug: act.slug, slug: "section-302", number: "302" },
-    listAvailable: true, note: "Not an exhaustive list.", total: 3, totalIsLowerBound: false, cases: ids.map(caseRow),
+    listAvailable: true, note: "Not an exhaustive list.", cases: ids.map(caseRow),
   });
 
   it("sends cursor and limit and parses cases and meta flags", async () => {
     const { client, calls } = makeClient([
-      ok(body(["a"], null), { meta: { someRecordsWithheld: true }, pagination: { limit: 1, hasMore: false, nextCursor: null } }),
+      ok(body(["a"], null), { pagination: { limit: 1, hasMore: false, nextCursor: null } }),
     ]);
     const res = await client.listSectionCitingCases(act.slug, "section-302", { cursor: "c1", limit: 1 });
     expect(calls[0]?.url).toBe(`${BASE}/acts/${act.slug}/sections/section-302/citing-cases?cursor=c1&limit=1`);
     expect(res.data.cases[0]?.id).toBe("a");
     expect(res.data.listAvailable).toBe(true);
-    expect(res.meta?.someRecordsWithheld).toBe(true);
     expect(res.pagination.nextCursor).toBeNull();
   });
 
@@ -147,6 +146,19 @@ describe("listSectionCitingCases", () => {
     expect(pages).toEqual([["a", "b"], ["c"]]);
     expect(calls).toHaveLength(2);
     expect(new URL(calls[1]!.url).searchParams.get("cursor")).toBe("c2");
+  });
+
+  it("follows nextCursor through an empty middle page and stops when it is null", async () => {
+    const { client, calls } = makeClient([
+      ok(body(["a"], "c2"), { pagination: { limit: 2, hasMore: true, nextCursor: "c2" } }),
+      ok(body([], "c3"), { pagination: { limit: 2, hasMore: true, nextCursor: "c3" } }),
+      ok(body(["b"], null), { pagination: { limit: 2, hasMore: false, nextCursor: null } }),
+    ]);
+    const ids: string[] = [];
+    for await (const page of client.iterSectionCitingCases(act.slug, "section-302", { limit: 2 })) ids.push(...page.map((c) => c.id));
+    expect(ids).toEqual(["a", "b"]);
+    expect(calls).toHaveLength(3);
+    expect(new URL(calls[2]!.url).searchParams.get("cursor")).toBe("c3");
   });
 
   it("maps a bad cursor to ValidationError CURSOR_INVALID and 404 to SECTION_NOT_FOUND", async () => {

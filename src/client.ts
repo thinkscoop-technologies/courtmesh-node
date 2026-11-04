@@ -1264,12 +1264,13 @@ export class CourtMeshClient {
    *
    * This is not an exhaustive list of every judgment applying the provision,
    * and an empty list does not mean no judgment applied it. `listAvailable`
-   * is false for a provision judgments cannot be listed for. Withheld matters
-   * are left out (`meta.someRecordsWithheld`); if that check could not run,
-   * titles are masked (`meta.restrictedCheckDegraded`). Read a judgment with
-   * `getCase(id)`. A temporary failure throws `BadGatewayError`
-   * (`UPSTREAM_UNAVAILABLE`), is free and is safe to retry. 1 credit when
-   * cases come back.
+   * is false for a provision we do not list judgments for, including sexual
+   * offences and cruelty provisions. Some matters are never listed. A page
+   * can hold fewer rows than `limit`, or none, while `pagination.hasMore` is
+   * true, so keep following `pagination.nextCursor`; it is opaque, so pass it
+   * back unchanged. Read a judgment with `getCase(id)`. A failed check
+   * throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`), is free and is safe to
+   * retry. 1 credit when cases come back.
    */
   async listSectionCitingCases(
     slug: string,
@@ -1287,7 +1288,8 @@ export class CourtMeshClient {
 
   /**
    * Walks `listSectionCitingCases`, yielding one page of judgments at a time
-   * until the last. The same caveats apply: the list is not exhaustive.
+   * until `nextCursor` is null. An empty page in the middle is skipped over, not
+   * treated as the end. The same caveats apply: the list is not exhaustive.
    */
   iterSectionCitingCases(
     slug: string,
