@@ -52,6 +52,25 @@ import type {
   UsageMeta,
 } from "./types.js";
 import { normalizeCnr } from "./monitoring.js";
+import {
+  assertCheckBody,
+  assertCourtListQuery,
+  assertDateRange,
+  assertMatterId,
+  LISTINGS_MAX_DAYS,
+} from "./cause-lists.js";
+import type {
+  CauseListCheckData,
+  CauseListCourtList,
+  CauseListingsResponse,
+  CauseListing,
+  CauseListMeta,
+  CheckCauseListsOptions,
+  GetCourtCauseListOptions,
+  ListCauseListingsOptions,
+  CauseListRangeOptions,
+  MatterCauseListings,
+} from "./cause-lists.js";
 import type {
   AddWatchlistItemsResult,
   ChangeEvent,
@@ -143,7 +162,7 @@ export interface RequestConfig {
    * Only meaningful on the POST methods that accept an `Idempotency-Key`
    * header: `screenParty`, `screenPartyBatch`, `analyzeCase`,
    * `analyzeConsolidated`, `requestTimeline`, `createWatchlist`,
-   * `addWatchlistItems`, `createWebhook`. (`rotateWebhookSecret`,
+   * `addWatchlistItems`, `createWebhook`, `checkCauseLists`. (`rotateWebhookSecret`,
    * `testWebhook` and `retryWebhookDelivery` accept the option too, but the
    * server does not deduplicate them.) 1 to 128 characters,
    * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
@@ -1140,6 +1159,154 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* Cause lists                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * One page of the listings found for the matters in your account, within a
+   * date range of at most 31 days (default: today and the next 7 days).
+   * Needs the `causelist` scope. 1 credit per successful call; a failed call
+   * is not charged. Only listings that were found are returned: an empty page
+   * does not mean a matter is not listed. Pages start at 1.
+   *
+   * Throws `ValidationError` for a bad date range before any request is
+   * sent (`page` and `limit` are checked by the server). A temporary outage is
+   * `BadGatewayError` (`UPSTREAM_UNAVAILABLE`, not charged; GET calls are
+   * retried by the client before it is thrown); an account without cause list access is
+   * `PermissionError` (`CAUSE_LISTS_NOT_ENABLED`).
+   */
+  async listCauseListings(
+    options: ListCauseListingsOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CauseListingsResponse> {
+    assertDateRange(options, LISTINGS_MAX_DAYS);
+    return this.request<CauseListingsResponse>({
+      method: "GET",
+      path: "/cause-lists/listings",
+      query: { from: options.from, to: options.to, page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `listCauseListings`, yielding one page of listings at a time until
+   * `pagination.hasMore` is false. Each page is one call and one credit.
+   * `PAGE_LIMIT_EXCEEDED` and `PAGINATION_DEPTH_EXCEEDED` surface as
+   * `ValidationError`, as on search.
+   */
+  async *iterCauseListings(
+    options: ListCauseListingsOptions = {},
+  ): AsyncGenerator<CauseListing[], void, unknown> {
+    let page = options.page ?? 1;
+    for (let i = 0; i < MAX_ITERATOR_PAGES; i++) {
+      const response = await this.listCauseListings({ ...options, page });
+      const data = response.data ?? [];
+      if (data.length > 0) yield data;
+      if (data.length === 0 || !response.pagination?.hasMore) return;
+      page += 1;
+    }
+    throw new Error(
+      `iterCauseListings exceeded the safety guard of ${MAX_ITERATOR_PAGES} pages. This usually means ` +
+        "the server keeps reporting hasMore: true without making progress.",
+    );
+  }
+
+  /**
+   * The listings found for one matter in your account (`matterId` is its 24
+   * character id), within a date range of at most 31 days. 1 credit per
+   * successful call. An unknown matter throws `NotFoundError`
+   * (`MATTER_NOT_FOUND`), not charged.
+   */
+  async listMatterCauseListings(
+    matterId: string,
+    options: CauseListRangeOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<{ success: true; data: MatterCauseListings; meta?: CauseListMeta; requestId?: string }> {
+    assertMatterId(matterId);
+    assertDateRange(options, LISTINGS_MAX_DAYS);
+    return this.request({
+      method: "GET",
+      path: `/matters/${encodeURIComponent(matterId)}/cause-listings`,
+      query: { from: options.from, to: options.to },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * The published list of one court for one date, for a court you have an
+   * open matter in. `data.status` says what was read: `ok` and `partial`
+   * carry rows (1 credit); `none`, `empty`, `not_published`, `invalid_court`
+   * and `unavailable` are a 200 with no rows and cost 0 (read
+   * `meta.creditsCharged`). The call still needs 1 credit available when it
+   * starts. A court with no open matter of yours throws `NotFoundError`
+   * (`COURT_LIST_NOT_FOUND`), not charged.
+   */
+  async getCourtCauseList(
+    options: GetCourtCauseListOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<{ success: true; data: CauseListCourtList; meta?: CauseListMeta; requestId?: string }> {
+    assertCourtListQuery(options);
+    return this.request({
+      method: "GET",
+      path: "/cause-lists/court",
+      query: { courtKey: options.courtKey, date: options.date },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Checks whether 1 to 100 CNRs that your account watches appear on a stored
+   * cause list, for a range of at most 7 days (default: today and tomorrow,
+   * Indian calendar). Needs the `causelist` scope. The call never contacts a
+   * court: it reads lists already held.
+   *
+   * Each result has a `status`:
+   * - `listed`: a row of the case was found (1 credit).
+   * - `no_entry_found`: a list was read and no row was recognised (1 credit).
+   *   This is not proof that the case is not listed; `dates[].complete` says
+   *   how much was read.
+   * - `list_not_read`, `cannot_check`, `not_watched`: free.
+   *
+   * At most 100 CNRs, and the number of distinct CNRs times the number of
+   * dates in the range (inclusive, 2 by default) at most 300; both are
+   * checked before a request is sent. Repeats of a CNR are ignored.
+   *
+   * Price: 1 credit per CNR with status `listed` or `no_entry_found`, settled
+   * once for the whole call (`meta.creditsCharged`). The call also needs at
+   * least 1 credit available when it starts: a balance below the number of
+   * watched CNRs in it throws `InsufficientCreditsError`. The same error can
+   * arrive after the answer is ready, when the credits due cannot be settled;
+   * no results are returned then. A `ServiceUnavailableError` with
+   * `apiCode === "SETTLEMENT_UNCONFIRMED"` means the charge outcome is unknown:
+   * it is never retried automatically, even with `retryPosts`, and you should
+   * check your balance (`usage()`) first. Repeating the call with the same
+   * `Idempotency-Key` is refused with 409 `IDEMPOTENCY_IN_PROGRESS` for up to
+   * 24 hours. A 503 `ENTITLEMENT_UNAVAILABLE` ran nothing and is safe to retry.
+   *
+   * `data.from` and `data.to` are the dates that were looked at (the default
+   * range is resolved by the server). Only positive listings are reported. A
+   * temporary outage is `BadGatewayError` (`UPSTREAM_UNAVAILABLE`) for the
+   * whole call, not charged. Accepts an `Idempotency-Key` like the other
+   * POST calls.
+   */
+  async checkCauseLists(
+    options: CheckCauseListsOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<{
+    success: true;
+    data: CauseListCheckData;
+    meta?: CauseListMeta;
+    requestId?: string;
+    replayed?: boolean;
+  }> {
+    assertCheckBody(options);
+    const body: Record<string, unknown> = { cnrs: options.cnrs.map(cnrForRequest) };
+    if (options.from !== undefined) body.from = options.from;
+    if (options.to !== undefined) body.to = options.to;
+    return this.postJson("/cause-lists/check", body, requestOptions);
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
 
@@ -1312,7 +1479,13 @@ export class CourtMeshClient {
 
         // Not a retryable code (a daily/monthly cap, R2) or attempts are
         // exhausted: fall through to the generic throw below.
-      } else if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxAttempts && canRetryAfterDispatch) {
+      } else if (
+        RETRYABLE_STATUS_CODES.has(response.status) &&
+        attempt < maxAttempts &&
+        canRetryAfterDispatch &&
+        // The charge outcome is unknown: a retry could charge again, whatever retryPosts says.
+        !(response.status === 503 && extractApiCode(json) === "SETTLEMENT_UNCONFIRMED")
+      ) {
         await delay(computeBackoffMs(attempt));
         continue;
       }

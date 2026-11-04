@@ -7,6 +7,18 @@ Each entry also states which server flags/behaviour the version targets on
 the CourtMesh research server, since some of this SDK's contract only takes
 effect once a given server flag is on for your account.
 
+## [Unreleased]
+
+Adds the cause list calls. They need the `causelist` scope and an account with cause lists enabled.
+
+### Added
+
+- `listCauseListings` and `iterCauseListings` for `GET /cause-lists/listings`, `listMatterCauseListings` for `GET /matters/{matterId}/cause-listings`, `getCourtCauseList` for `GET /cause-lists/court`, and `checkCauseLists` for `POST /cause-lists/check` (1 to 100 watched CNRs, at most 7 days).
+- Statuses `listed`, `no_entry_found`, `list_not_read`, `cannot_check` and `not_watched`. `listed` and `no_entry_found` cost 1 credit per CNR, the others are free. `no_entry_found` does not show a case is not listed.
+- Types for listings, court lists, rows, pagination and the check result, including `data.from` and `data.to` (the dates looked at) and the `reason` values of `cannot_check`. A check is limited to 100 CNRs and to distinct CNRs times dates of at most 300, validated before a request is sent. A 503 `SETTLEMENT_UNCONFIRMED` (the charge outcome is unknown) is never retried automatically, even with `retryPosts`; check your balance first.
+- `matterId` (24 hex characters), `courtKey`, dates and the CNR count are checked before a request is sent and throw `ValidationError`.
+- A `502` with `UPSTREAM_UNAVAILABLE` raises the existing `BadGatewayError`; it is not charged and GET calls are retried as before. `CAUSE_LISTS_NOT_ENABLED` (403) raises `PermissionError`.
+
 ## [0.5.0]
 
 Adds CNR lookup and case monitoring (API docs 1.3.0).

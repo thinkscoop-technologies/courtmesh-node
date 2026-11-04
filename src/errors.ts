@@ -436,7 +436,15 @@ export class BadGatewayError extends CourtMeshError {
   }
 }
 
-/** 503, account standing could not be verified (`ENTITLEMENT_UNAVAILABLE`), or the service is otherwise unavailable. Safe to retry. */
+/**
+ * 503. `apiCode` `ENTITLEMENT_UNAVAILABLE`: account standing could not be
+ * verified, nothing ran, safe to retry. `SETTLEMENT_UNCONFIRMED` (the cause
+ * list check): the answer was ready but the charge could not be confirmed and
+ * no results were returned. The charge outcome is unknown, so this is never
+ * retried automatically: check your balance (`usage()`) first. A retry with
+ * the same `Idempotency-Key` is refused with 409 `IDEMPOTENCY_IN_PROGRESS`
+ * for up to 24 hours. Any other 503 is the service being unavailable.
+ */
 export class ServiceUnavailableError extends CourtMeshError {
   constructor(message: string, body: unknown, extra: CourtMeshErrorExtra = {}) {
     super(message, "service_unavailable", 503, body, extra);

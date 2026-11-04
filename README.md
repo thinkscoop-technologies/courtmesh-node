@@ -370,7 +370,56 @@ Each attempt has a 10 second deadline and reads at most 64 KB of your response. 
 | `listWebhooks` / `iterWebhooks` | `GET /webhooks` | 0 |
 | `listWebhookDeliveries` / `iterWebhookDeliveries`, `retryWebhookDelivery` | `/webhooks/{id}/deliveries` | 0 |
 
-Watch caps per account (distinct CNRs across all watchlists, so the same CNR on two lists uses one slot): Free 10, Pay As You Go 1,000, Scale 10,000, Enterprise by contract. Two daily limits apply to adding, counted per Indian calendar day, and items over either come back as `cap_exceeded` with a message: every add that results in a watched or pending item counts toward a daily add allowance (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000), and adding CNRs we do not hold yet starts a live fetch, so those also have their own daily limit (Free 20, Pay As You Go 500, Scale 5,000, Enterprise unlimited). A Supreme Court CNR we do not hold comes back `not_found` at once. If the court portal had nothing for a CNR in the last 24 hours, adding it again is `not_found` with a message and starts no new fetch (the same cooldown makes `getCaseByCnr(..., { fetch: true })` throw `NotFoundError`). `not_found`, `error` and `unavailable` items still count toward the cap until removed. At most 50 watchlists and 10 webhook endpoints per account. `WATCH_CAP_EXCEEDED` (403) is thrown only when the cap is already full and you sent a new CNR. Webhook delivery history is kept 30 days and events 90 days; an event appears in the feed about 2 seconds after it is created. New error codes surface as typed errors with `apiCode` set: `INVALID_CNR`, `WATCHLIST_NOT_FOUND`, `WEBHOOK_NOT_FOUND`, `DELIVERY_NOT_FOUND`, `WATCH_CAP_EXCEEDED`, `WATCHLIST_LIMIT_REACHED`, `WEBHOOK_LIMIT_REACHED`, `INVALID_WEBHOOK_URL`, `ITEM_NOT_FOUND` (removing a CNR that is not in the list). API keys need the `monitoring:read` and `monitoring:write` scopes (keys without explicit scopes have full access).
+Watch caps per account (distinct CNRs across all watchlists, so the same CNR on two lists uses one slot): Free 10, Pay As You Go 1,000, Scale 10,000, Enterprise by contract. Two daily limits apply to adding, counted per Indian calendar day, and items over either come back as `cap_exceeded` with a message: every add that results in a watched or pending item counts toward a daily add allowance (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000), and adding CNRs we do not hold yet starts a live fetch, so those also have their own daily limit (Free 20, Pay As You Go 500, Scale 5,000, Enterprise unlimited). A Supreme Court CNR we do not hold comes back `not_found` at once. If the court portal had nothing for a CNR in the last 24 hours, adding it again is `not_found` with a message and starts no new fetch (the same cooldown makes `getCaseByCnr(..., { fetch: true })` throw `NotFoundError`). `not_found`, `error` and `unavailable` items still count toward the cap until removed. At most 50 watchlists and 10 webhook endpoints per account. `WATCH_CAP_EXCEEDED` (403) is thrown only when the cap is already full and you sent a new CNR. Webhook delivery history is kept 30 days and events 90 days; an event appears in the feed about 2 seconds after it is created. New error codes surface as typed errors with `apiCode` set: `INVALID_CNR`, `WATCHLIST_NOT_FOUND`, `WEBHOOK_NOT_FOUND`, `DELIVERY_NOT_FOUND`, `WATCH_CAP_EXCEEDED`, `WATCHLIST_LIMIT_REACHED`, `WEBHOOK_LIMIT_REACHED`, `INVALID_WEBHOOK_URL`, `ITEM_NOT_FOUND` (removing a CNR that is not in the list). API keys need the `monitoring:read` and `monitoring:write` scopes (keys without explicit scopes have full access). Cause list calls need the `causelist` scope.
+
+## Cause lists
+
+Read the hearing listings found for your matters, read the published list of a court you have a matter in, and check whether CNRs you watch appear on a stored list. All calls need an API key with the `causelist` scope and an account with cause lists enabled.
+
+```ts
+// Listings found for your matters. Default range: today and the next 7 days. At most 31 days.
+const first = await client.listCauseListings({ from: "2026-11-05", to: "2026-11-12", limit: 50 });
+console.log(first.data, first.pagination); // { page, limit, total, totalPages, hasMore }
+
+// Walk every page (pages start at 1; each page is one call).
+for await (const listings of client.iterCauseListings({ from: "2026-11-05", to: "2026-11-12" })) {
+  for (const listing of listings) console.log(listing.date, listing.courtKey, listing.caseText);
+}
+
+// One matter. matterId is the 24 character id.
+const one = await client.listMatterCauseListings("66f1a2b3c4d5e6f7a8b9c0d1");
+console.log(one.data.matter, one.data.listings);
+
+// The published list of one court on one date. courtKey comes from a listing.
+const court = await client.getCourtCauseList({ courtKey: "DC:99:1:9900001:1:1", date: "2026-11-05" });
+console.log(court.data.status, court.data.complete, court.data.rows.length);
+
+// Check CNRs you watch (1 to 100). Default range: today and tomorrow. At most 7 days.
+const check = await client.checkCauseLists({ cnrs: ["ZZAB010000012024", "ZZAB010000022024"] });
+for (const r of check.data.results) console.log(r.cnr, r.status, r.reason, r.listings);
+console.log(check.data.summary, check.meta?.creditsCharged);
+```
+
+`from` and `to` are sent together or not at all. Dates, `matterId` and `courtKey` are checked before a request is sent and a bad value throws `ValidationError`. `courtKey` is `SC`, `HC:<state>:<bench>` or `DC:<state>:<district>:<complex>:<establishment>:<court number>`, digits only.
+
+| Method | Endpoint | Credits |
+|---|---|---|
+| `listCauseListings` / `iterCauseListings` | `GET /cause-lists/listings` | 1 per successful call |
+| `listMatterCauseListings(matterId)` | `GET /matters/{matterId}/cause-listings` | 1 per successful call |
+| `getCourtCauseList({ courtKey, date })` | `GET /cause-lists/court` | 1 when `status` is `ok` or `partial`; 0 for `none`, `empty`, `not_published`, `invalid_court` and `unavailable` |
+| `checkCauseLists({ cnrs, from, to })` | `POST /cause-lists/check` | 1 per CNR with status `listed` or `no_entry_found`; 0 for the rest |
+
+`checkCauseLists` never contacts a court: it reads lists already held, and it takes an `Idempotency-Key` like the other POST calls. Each result has one of these statuses:
+
+| Status | Meaning | Credits |
+|---|---|---|
+| `listed` | A row of this case was found. `listings` holds the rows. | 1 |
+| `no_entry_found` | A list was read and no row was recognised. This does not show the case is not listed: `dates[].complete` says how much of each list was read. | 1 |
+| `list_not_read` | No list was held for the dates. For a District Court it can also mean the list of the case's own courtroom could not be confirmed (`dates[].status` is then `none`). | 0 |
+| `cannot_check` | `reason` says why: `pending`, `record_unavailable`, `court_not_supported`, or a court identification reason (`no_case_identity`, `no_court_key`, `no_court_number`, `invalid_court_key`, `unsupported_court`). `courtKey` can be null. | 0 |
+| `not_watched` | Your account does not watch this CNR. | 0 |
+
+Only listings that were found are reported. An empty result is not a statement that a case is absent from a list, so confirm against the court's own list when it matters. At most 100 CNRs, and distinct CNRs (repeats are ignored) times dates in the range (inclusive; 2 by default) at most 300, checked before a request is sent (`ValidationError`). The call also needs at least 1 credit available when it starts: a balance below the number of watched CNRs in the call throws `InsufficientCreditsError`. The same error can arrive after the answer is ready, when the credits due cannot be settled; no results are returned then. A `ServiceUnavailableError` with `apiCode` `SETTLEMENT_UNCONFIRMED` means the answer was ready but the charge outcome is unknown and no results were returned: it is never retried automatically, even with `retryPosts`, so check your balance with `usage()` first; repeating the call with the same `Idempotency-Key` is refused with 409 `IDEMPOTENCY_IN_PROGRESS` for up to 24 hours. A 503 `ENTITLEMENT_UNAVAILABLE` ran nothing and is safe to retry. A listing's `matchedBy` is `cnr`, `diary`, `key` or `related_key`; `caseText` and `courtKey` can be null. `data.from` and `data.to` give the dates that were looked at, including when you sent none. A temporary outage throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`) and is not charged; GET calls are retried, and the check call is retried only when `retryPosts` is on (it then sends an `Idempotency-Key`). An account without cause list access throws `PermissionError` (`CAUSE_LISTS_NOT_ENABLED`); an unknown matter or a court without an open matter of yours throws `NotFoundError`.
 
 ## Pagination
 
@@ -446,7 +495,7 @@ try {
 | `RateLimitError` | 429 | `retryAfter`/`retryAfterSeconds` (seconds), `resetTime` (ISO string), and `apiCode` (`RATE_LIMITED`, `CONCURRENT_ANALYSIS_LIMIT`, or a daily/monthly cap code like `DISTINCT_NAMES_LIMIT_REACHED`) |
 | `ServerError` | 500 | |
 | `BadGatewayError` | 502 | also `PARTY_SCREEN_SEARCH_DEGRADED` - the underlying case search itself errored and returned nothing usable, retry |
-| `ServiceUnavailableError` | 503 | `apiCode: "ENTITLEMENT_UNAVAILABLE"` when account standing could not be verified |
+| `ServiceUnavailableError` | 503 | `apiCode: "ENTITLEMENT_UNAVAILABLE"` when account standing could not be verified (safe to retry). `apiCode: "SETTLEMENT_UNCONFIRMED"` on `checkCauseLists`: the charge outcome is unknown, never retried automatically, check your balance first |
 
 Every error class exposes `apiCode` (the server's `code` field verbatim, when sent) and `requestId` (echoed once the API's request-id middleware ships). `API_REFUSAL_CODES` is exported as a runtime object mirroring the server's own refusal codes (`ApiRefusalCode` is the matching type), for comparing against `error.apiCode` without hand-typing string literals:
 
