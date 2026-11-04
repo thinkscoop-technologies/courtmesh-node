@@ -133,6 +133,18 @@ export type {
   PartyScreenBatchMeta,
   HealthCheckResult,
   HealthCheckEntry,
+  CaseInclude,
+  GetCaseOptions,
+  CaseAdvocates,
+  CaseHearing,
+  CaseDocumentKind,
+  CaseDocumentRow,
+  CaseDocuments,
+  CaseDocumentText,
+  CnrRefreshStatus,
+  CnrRefreshResult,
+  CnrRefreshBatch,
+  CnrRefreshState,
 } from "./types.js";
 
 export { normalizeCnr, assertCnr, verifyWebhookSignature, WebhookSignatureError } from "./monitoring.js";

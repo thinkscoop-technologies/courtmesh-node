@@ -7,6 +7,17 @@ Each entry also states which server flags/behaviour the version targets on
 the CourtMesh research server, since some of this SDK's contract only takes
 effect once a given server flag is on for your account.
 
+## [0.6.0]
+
+Adds case depth and refresh by CNR (API docs 1.4.0).
+
+### Added
+
+- `include` on `getCase` and `getCaseByCnr`: hearing history and advocates, at no extra charge. Either can be null when no such record is held.
+- `listCaseOrders` (1 credit): the documents of a case with availability flags. `getCaseDocumentText`: the stored text of one, 2 credits and charged only when text is returned.
+- `refreshCaseByCnr`, `getCaseRefreshState` and `refreshCasesBatch`: refresh by CNR, one at a time or up to 50, with a free status read.
+- `ORDER_TEXT_LIMIT_REACHED` error code.
+
 ## [0.5.0]
 
 Adds CNR lookup and case monitoring (API docs 1.3.0).

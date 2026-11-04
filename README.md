@@ -270,6 +270,30 @@ for (const court of data.courts) {
 console.log(data.districtCourts.records);
 ```
 
+## Case depth and refresh by CNR
+
+```ts
+// Hearing history and advocates, at no extra charge. Either can be null when we hold no such record.
+const record = await client.getCase(id, { include: ["hearings", "advocates"] });
+
+// The documents of a case, then the stored text of one. 2 credits when text comes back, free when it does not.
+const { data } = await client.listCaseOrders(id);
+const row = data.documents.find((d) => d.textAvailable);
+if (row) {
+  const text = await client.getCaseDocumentText(id, row.id);
+  console.log(text.data.text);
+}
+
+// Refresh by CNR: answers at once. 1 credit when queued, 0 for every other status.
+await client.refreshCaseByCnr("DLHC010084212021");
+const state = await client.getCaseRefreshState("DLHC010084212021"); // free
+
+// Up to 50 CNRs in one call, a status for each.
+const batch = await client.refreshCasesBatch(["DLHC010084212021", "DLHC010084222021"]);
+```
+
+Not every order has readable text, and how many do varies by court and by age, so read `textAvailable` rather than assuming. Calls that return text count against a monthly allowance (`ORDER_TEXT_LIMIT_REACHED`). A refresh charged on acceptance is not refunded if the court fetch later fails.
+
 ## CNR lookup and case monitoring
 
 Look a case up by CNR (any common spelling works), or watch a list of CNRs and be told when something changes. Tracking is free within your plan's watch cap; you pay only for reading the change feed (1 credit per non-empty page of up to 100 events) and for CNR lookups (1 credit per record returned).

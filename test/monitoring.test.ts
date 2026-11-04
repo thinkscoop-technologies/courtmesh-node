@@ -44,6 +44,49 @@ describe("normalizeCnr", () => {
   });
 });
 
+describe("case depth and refresh", () => {
+  it("sends include on getCase and getCaseByCnr, and nothing without it", async () => {
+    const { client, calls } = makeClient([ok({ id: "c1" }), ok({ id: "c1" }), ok({ cnr: CNR, status: "found" }), ok({ cnr: CNR, status: "found" })]);
+    await client.getCase("c1");
+    await client.getCase("c1", { include: ["hearings", "advocates"] });
+    await client.getCaseByCnr(CNR, { include: ["hearings"] });
+    await client.getCaseByCnr(CNR, { fetch: true, include: ["advocates"] });
+    expect(calls[0]?.url).toBe(`${BASE}/cases/c1`);
+    expect(decodeURIComponent(calls[1]?.url ?? "")).toBe(`${BASE}/cases/c1?include=hearings,advocates`);
+    expect(calls[2]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?include=hearings`);
+    expect(calls[3]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?fetch=true&include=advocates`);
+  });
+
+  it("reads the orders and text of a case", async () => {
+    const { client, calls } = makeClient([
+      ok({ caseId: "c1", documents: [] }),
+      ok({ caseId: "c1", documentId: "d1", textAvailable: false, text: null }),
+    ]);
+    await client.listCaseOrders("c1");
+    const text = await client.getCaseDocumentText("c1", "d1");
+    expect(calls[0]?.url).toBe(`${BASE}/cases/c1/orders`);
+    expect(calls[1]?.url).toBe(`${BASE}/cases/c1/orders/d1/text`);
+    expect(text.data.textAvailable).toBe(false);
+  });
+
+  it("refreshes by CNR, reads the state and sends a normalised batch", async () => {
+    const { client, calls } = makeClient([
+      { status: 202, body: { success: true, data: { input: CNR, cnr: CNR, status: "queued", caseId: "c1", lastRefreshedAt: null } } },
+      ok({ cnr: CNR, state: "running", lastRefreshedAt: null }),
+      ok({ results: [], summary: { requested: 1, started: 0 } }),
+    ]);
+    const res = await client.refreshCaseByCnr("cnr: dlhc-01-008421-2021");
+    await client.getCaseRefreshState(CNR);
+    await client.refreshCasesBatch(["dlhc-01-008421-2021", "junk"]);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}/refresh`);
+    expect(res.data.status).toBe("queued");
+    expect(calls[1]?.method).toBe("GET");
+    expect(calls[2]?.url).toBe(`${BASE}/cases/refresh/batch`);
+    expect(calls[2]?.body).toEqual({ cnrs: [CNR, "junk"] });
+  });
+});
+
 describe("getCaseByCnr", () => {
   it("normalises the CNR and returns a found record", async () => {
     const { client, calls } = makeClient([ok({ cnr: CNR, status: "found", case: { id: "c1" }, requestId: null })]);
@@ -319,10 +362,10 @@ describe("HTTP layer", () => {
     expect(patch.calls).toHaveLength(1);
   });
 
-  it("sends the 0.5.0 user agent", async () => {
+  it("sends the 0.6.0 user agent", async () => {
     const { client, calls } = makeClient([ok({ id: "wh_1" })]);
     await client.getWebhook("wh_1");
-    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.5.0");
+    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.6.0");
   });
 });
 

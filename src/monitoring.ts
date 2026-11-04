@@ -3,6 +3,7 @@
  * helpers that do not need a network call: `normalizeCnr` and
  * `verifyWebhookSignature`.
  */
+import type { CaseInclude } from "./types.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /* -------------------------------------------------------------------------- */
@@ -81,6 +82,8 @@ export interface CursorListOptions {
 /* -------------------------------------------------------------------------- */
 
 export interface GetCaseByCnrOptions {
+  /** Hearing history and advocates, at no extra charge. */
+  include?: readonly CaseInclude[];
   /**
    * When the CNR is not in the corpus, start a live court portal fetch.
    * The call that starts it returns `pending` and is free; the poll that

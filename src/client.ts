@@ -50,6 +50,13 @@ import type {
   TimelineJob,
   UsageData,
   UsageMeta,
+  GetCaseOptions,
+  CaseDocuments,
+  CaseDocumentText,
+  CaseInclude,
+  CnrRefreshBatch,
+  CnrRefreshResult,
+  CnrRefreshState,
 } from "./types.js";
 import { normalizeCnr } from "./monitoring.js";
 import type {
@@ -82,7 +89,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.5.0";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.6.0";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 
@@ -184,6 +191,10 @@ const ENDPOINT_TIMEOUT_MS = {
 
 /** The maximum number of pages an async iterator will walk before it gives up as a safety guard. */
 const MAX_ITERATOR_PAGES = 10000;
+
+function includeQuery(include: readonly CaseInclude[] | undefined): { include: string } | undefined {
+  return include?.length ? { include: include.join(",") } : undefined;
+}
 
 /** Canonical CNR when the input normalises, else the trimmed input so the server can answer `INVALID_CNR`. */
 function cnrForRequest(cnr: string): string {
@@ -485,10 +496,58 @@ export class CourtMeshClient {
   /* 4. GET /cases/{id}                                                     */
   /* ---------------------------------------------------------------------- */
 
-  async getCase(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
+  /**
+   * Pass `{ include: ["hearings", "advocates"] }` for hearing history and
+   * advocates, at no extra charge. Either can come back `null` when we hold no
+   * such record for this case, and empty when we hold it and it lists none.
+   */
+  async getCase(id: string, options: GetCaseOptions = {}): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
     return this.request<ApiResponse<CaseDetails, GetCaseMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}`,
+      query: includeQuery(options.include),
+      timeoutMs: options.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /cases/{id}/orders                                                 */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Lists the documents we hold for a case, newest first, with what is
+   * available for each. Read `textAvailable` before asking for the text: not
+   * every order has readable text. 1 credit.
+   */
+  async listCaseOrders(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CaseDocuments>> {
+    return this.request<ApiResponse<CaseDocuments>>({
+      method: "GET",
+      path: `/cases/${encodeURIComponent(id)}/orders`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /cases/{id}/orders/{documentId}/text                               */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Reads the stored text of one document of a case. 2 credits when text is
+   * returned; when we hold none, `data.textAvailable` is `false`, `data.text`
+   * is `null` and the call is free. Calls that return text count against a
+   * monthly allowance (`ORDER_TEXT_LIMIT_REACHED`). The text is machine read
+   * from the court document, so check anything you rely on against the
+   * original. Taken down and masked matters throw `PermissionDeniedError`
+   * (`CASE_RESTRICTED`).
+   */
+  async getCaseDocumentText(
+    id: string,
+    documentId: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<CaseDocumentText>> {
+    return this.request<ApiResponse<CaseDocumentText>>({
+      method: "GET",
+      path: `/cases/${encodeURIComponent(id)}/orders/${encodeURIComponent(documentId)}/text`,
       timeoutMs: requestOptions.timeoutMs,
     });
   }
@@ -858,8 +917,66 @@ export class CourtMeshClient {
     return this.request<ApiResponse<CnrLookupData, GetCaseMeta>>({
       method: "GET",
       path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
-      query: options.fetch ? { fetch: true } : undefined,
+      query: options.fetch || options.include?.length
+        ? { ...(options.fetch ? { fetch: true } : {}), ...includeQuery(options.include) }
+        : undefined,
       timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* POST /cases/by-cnr/{cnr}/refresh                                       */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Queues a fresh read from the court and answers at once. A CNR we do not
+   * hold yet is fetched too. `data.status === "queued"` costs 1 credit, charged
+   * on acceptance; every other status costs 0, including `running` when a
+   * refresh is already under way. Read progress with `getCaseRefreshState`.
+   * Not available on the Free tier.
+   */
+  async refreshCaseByCnr(cnr: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshResult>> {
+    return this.request<ApiResponse<CnrRefreshResult>>({
+      method: "POST",
+      path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}/refresh`,
+      body: {},
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
+    });
+  }
+
+  /**
+   * Where a CNR's refresh stands. Free, and counts against the daily distinct
+   * cases allowance, so poll a few at a time. `failed` when the latest attempt
+   * gave up. Not available on the Free tier.
+   */
+  async getCaseRefreshState(cnr: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshState>> {
+    return this.request<ApiResponse<CnrRefreshState>>({
+      method: "GET",
+      path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}/refresh`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* POST /cases/refresh/batch                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Refreshes up to 50 CNRs in one call and answers at once, with a `status`
+   * for each. 1 credit per CNR that reaches `queued`; every other status costs
+   * 0. When the daily live fetch allowance runs out the rest answer
+   * `not_accepted` and `meta.truncated` is `true`.
+   */
+  async refreshCasesBatch(cnrs: string[], requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshBatch>> {
+    return this.request<ApiResponse<CnrRefreshBatch>>({
+      method: "POST",
+      path: "/cases/refresh/batch",
+      body: { cnrs: cnrs.map(cnrForRequest) },
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 

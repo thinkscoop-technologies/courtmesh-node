@@ -393,6 +393,97 @@ export interface CaseDetails {
   hasDocuments?: boolean;
   documentCount?: number;
   hasAnalysis?: boolean;
+  /** Present with `include: ["advocates"]`. Null when we hold no such record. */
+  advocates?: CaseAdvocates | null;
+  /** Present with `include: ["hearings"]`, newest first. Null when we hold no such record. */
+  hearings?: CaseHearing[] | null;
+  hearingCount?: number | null;
+  hearingsTruncated?: boolean;
+}
+
+export type CaseInclude = "hearings" | "advocates";
+
+export interface CaseAdvocates {
+  petitioner: string[];
+  respondent: string[];
+}
+
+export interface CaseHearing {
+  /** The day the matter was before the court. */
+  businessDate: string | null;
+  /** The next date the court fixed. */
+  hearingDate: string | null;
+  purpose: string | null;
+  judge: string | null;
+  causeListType: string | null;
+}
+
+export interface GetCaseOptions {
+  include?: readonly CaseInclude[];
+  timeoutMs?: number;
+}
+
+export type CaseDocumentKind = "case_document" | "order";
+
+export interface CaseDocumentRow {
+  id: string;
+  kind: CaseDocumentKind;
+  date: string | null;
+  orderNumber: string | null;
+  textAvailable: boolean;
+  /** A PDF of this document can be read through `getCasePdf`, which serves the case document only. */
+  pdfAvailable: boolean;
+}
+
+export interface CaseDocuments {
+  caseId: string;
+  documents: CaseDocumentRow[];
+}
+
+export interface CaseDocumentText {
+  caseId: string;
+  documentId: string;
+  kind: CaseDocumentKind;
+  date: string | null;
+  orderNumber: string | null;
+  textAvailable: boolean;
+  text: string | null;
+  textLength: number;
+  /** True when this may be only part of the document. */
+  textTruncated: boolean;
+  pdfAvailable: boolean;
+}
+
+export type CnrRefreshStatus =
+  | "queued"
+  | "running"
+  | "fresh"
+  | "not_found"
+  | "invalid"
+  | "restricted"
+  | "cooldown"
+  | "unsupported"
+  | "unavailable"
+  | "not_accepted";
+
+export interface CnrRefreshResult {
+  input: string;
+  cnr: string | null;
+  status: CnrRefreshStatus;
+  /** Set when `status` is `queued`. */
+  caseId: string | null;
+  lastRefreshedAt: string | null;
+}
+
+export interface CnrRefreshBatch {
+  results: CnrRefreshResult[];
+  summary: { requested: number; started: number };
+}
+
+export interface CnrRefreshState {
+  cnr: string;
+  state: "running" | "idle" | "not_found" | "failed";
+  lastRefreshedAt: string | null;
 }
 
 export interface GetCaseMeta {
