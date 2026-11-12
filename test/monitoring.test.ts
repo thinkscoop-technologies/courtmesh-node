@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { CourtMeshClient } from "../src/client.js";
-import { NotFoundError, ValidationError } from "../src/errors.js";
+import { NotFoundError, PermissionError, RateLimitError, ValidationError } from "../src/errors.js";
 import { normalizeCnr, assertCnr, verifyWebhookSignature, WebhookSignatureError } from "../src/monitoring.js";
 import { queueFetch } from "./helpers.js";
 
@@ -61,6 +61,42 @@ describe("getCaseByCnr", () => {
     expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?fetch=true`);
     expect(res.data.status).toBe("pending");
     expect(res.data.requestId).toBe("req_1");
+  });
+
+  it("sends no fetch parameter by default, so the server checks the official source", async () => {
+    const { client, calls } = makeClient([
+      { status: 202, body: { success: true, data: { cnr: CNR, status: "pending", case: null, requestId: "req_2" } } },
+    ]);
+    const res = await client.getCaseByCnr(CNR, {});
+    expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}`);
+    expect(res.data.status).toBe("pending");
+  });
+
+  it("sends fetch=false to opt out of the official source check", async () => {
+    const { client, calls } = makeClient([{ status: 404, body: { success: false, error: "No such case", code: "CASE_NOT_FOUND" } }]);
+    const err = await client.getCaseByCnr(CNR, { fetch: false }).catch((e) => e);
+    expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?fetch=false`);
+    expect(err).toBeInstanceOf(NotFoundError);
+  });
+
+  it("throws RateLimitError without retrying when the daily CNR check cap is reached", async () => {
+    const { client, calls } = makeClient([
+      { status: 429, body: { success: false, error: "Daily limit reached", code: "LIVE_FETCH_LIMIT_REACHED", retryAfter: 3600 } },
+    ]);
+    const err = await client.getCaseByCnr(CNR).catch((e) => e);
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect(err.apiCode).toBe("LIVE_FETCH_LIMIT_REACHED");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("fetch=true on a tier without live fetch throws PermissionError", async () => {
+    const { client, calls } = makeClient([
+      { status: 403, body: { success: false, error: "Not available on this plan", code: "LIVE_FETCH_NOT_ALLOWED" } },
+    ]);
+    const err = await client.getCaseByCnr(CNR, { fetch: true }).catch((e) => e);
+    expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?fetch=true`);
+    expect(err).toBeInstanceOf(PermissionError);
+    expect(err.apiCode).toBe("LIVE_FETCH_NOT_ALLOWED");
   });
 
   it("throws NotFoundError for a 404 CASE_NOT_FOUND", async () => {

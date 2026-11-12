@@ -835,20 +835,28 @@ export class CourtMeshClient {
    * 1 credit, charged only when a record is returned.
    *
    * `data.status` is `found` (200, `data.case` holds the record), or
-   * `pending` (202, a live fetch is running: poll this same call with the
-   * same CNR; `data.requestId` is opaque and is not accepted by
-   * `getTimeline`). A CNR that is not in the corpus and was not fetched
-   * throws `NotFoundError` (`apiCode === "CASE_NOT_FOUND"`). A Supreme Court
-   * CNR that is not in the corpus cannot be fetched live and throws it
-   * straight away.
+   * `pending` (202, the court's official source is being checked: poll this
+   * same call with the same CNR; `data.requestId` is opaque and is not
+   * accepted by `getTimeline`).
    *
-   * Pass `{ fetch: true }` to start a live court portal fetch for a CNR we
-   * do not hold yet. The call that starts the fetch returns `pending` and is
-   * free; the poll that returns the record is the one 1 credit charge, and a
-   * fetch the court portal cannot satisfy costs nothing. Fetches share the
-   * daily live fetch cap with `requestTimeline({ refresh: true })`. If the
-   * court portal had nothing for the CNR in the last 24 hours, `fetch: true`
-   * does not call it again: it throws `NotFoundError` immediately.
+   * By default a CNR we do not hold yet is checked at the official source:
+   * eCourts for High Court and District Court CNRs, the Supreme Court
+   * website for Supreme Court CNRs (which can take several minutes). The
+   * first call returns `pending` and is free; the poll that returns the
+   * record is the one 1 credit charge. When the court reports no such case,
+   * the poll throws `NotFoundError` (`apiCode === "CASE_NOT_FOUND"`) and
+   * nothing is charged. On a plan without live fetch the default simply
+   * throws `NotFoundError` on a miss.
+   *
+   * Pass `{ fetch: false }` to look only at what we already hold: a miss
+   * throws `NotFoundError` straight away. Pass `{ fetch: true }` to require
+   * the check; on a plan without live fetch that throws `PermissionError`
+   * (`apiCode === "LIVE_FETCH_NOT_ALLOWED"`). New CNR checks count against
+   * a daily per account cap shared with `requestTimeline({ refresh: true })`;
+   * past it the call throws `RateLimitError`
+   * (`apiCode === "LIVE_FETCH_LIMIT_REACHED"`), which is not retried
+   * automatically. If the court had nothing for the CNR in the last 24
+   * hours, it is not checked again and the call throws `NotFoundError`.
    */
   async getCaseByCnr(
     cnr: string,
@@ -858,7 +866,7 @@ export class CourtMeshClient {
     return this.request<ApiResponse<CnrLookupData, GetCaseMeta>>({
       method: "GET",
       path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
-      query: options.fetch ? { fetch: true } : undefined,
+      query: options.fetch === undefined ? undefined : { fetch: options.fetch },
       timeoutMs: requestOptions.timeoutMs,
     });
   }

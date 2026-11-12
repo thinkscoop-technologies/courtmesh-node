@@ -82,13 +82,20 @@ export interface CursorListOptions {
 
 export interface GetCaseByCnrOptions {
   /**
-   * When the CNR is not in the corpus, start a live court portal fetch.
-   * The call that starts it returns `pending` and is free; the poll that
-   * returns the record is the single 1 credit charge, and a failed fetch is
-   * free. Counts against the same daily live fetch cap as a timeline refresh.
-   * If the court portal had nothing for this CNR in the last 24 hours, no
-   * new fetch is started and the call throws `NotFoundError`
-   * (`CASE_NOT_FOUND`) straight away.
+   * Whether to check the court's official source for a CNR we do not hold.
+   *
+   * Left out (the default): the server checks it when your plan includes
+   * live fetch, and otherwise answers `NotFoundError` on a miss. `false`:
+   * never check, a miss throws `NotFoundError` (`CASE_NOT_FOUND`) straight
+   * away. `true`: require the check; on a plan without live fetch this
+   * throws `PermissionError` (`LIVE_FETCH_NOT_ALLOWED`).
+   *
+   * A check starts with a free `pending` (202) answer; the poll that
+   * returns the record is the single 1 credit charge, and a check that
+   * finds no case is free. New CNR checks count against a daily per account
+   * cap (`RateLimitError`, `LIVE_FETCH_LIMIT_REACHED`). If the court had
+   * nothing for this CNR in the last 24 hours, it is not checked again and
+   * the call throws `NotFoundError` straight away.
    */
   fetch?: boolean;
 }
