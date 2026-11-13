@@ -2,7 +2,7 @@
  * Types for the CourtMesh API.
  *
  * These types mirror the real request and response shapes documented in the
- * authoritative API spec, derived from the CourtMesh research server source.
+ * authoritative API spec.
  * Nothing here is invented, if a field is not documented it is not modeled.
  */
 
@@ -15,6 +15,26 @@ export type StringOrArray = string | string[];
 
 /** `year` accepts an int, a "YYYY" string, or an array of either. */
 export type YearParam = number | string | Array<number | string>;
+
+/** An act and its sections as the court record states them. The act name is as the court wrote it. */
+export interface CourtRecordAct {
+  act: string;
+  sections: string[];
+}
+
+/** The FIR a district case arose from, as the court record states it. Each field is omitted when the court has not recorded it. */
+export interface CourtRecordFir {
+  policeStation?: string;
+  firNumber?: string;
+  firYear?: string;
+}
+
+/** Another order or document of the same Supreme Court matter. Fetch it by `caseId` like any case. */
+export interface SameMatterEntry {
+  caseId: string;
+  decisionDate?: string | null;
+  caseType?: string;
+}
 
 /**
  * The generic success envelope used by every endpoint except `GET /health`.
@@ -56,13 +76,12 @@ export interface ApiResponse<T, M = Record<string, unknown>> {
  * Pagination shape returned by `POST /search/cases`.
  *
  * `page` is absent when the caller used cursor pagination. `totalPages` does
- * not exist on this endpoint. `nextCursor` has two shapes depending on
- * whether the API self-serve tiers flag is on for your account:
- *   - a signed, opaque string (pass it back as `cursor`) when it is on -
- *     this is the current, supported pagination mechanism;
- *   - the legacy raw OpenSearch sort tuple, an array like
+ * not exist on this endpoint. `nextCursor` has two shapes:
+ *   - a signed, opaque string (pass it back as `cursor`), the current,
+ *     supported pagination mechanism;
+ *   - the legacy raw sort tuple, an array like
  *     `[12.34, "68f0..."]` (pass it back as a JSON-encoded `searchAfter`
- *     string), when the flag is off for your account.
+ *     string).
  * Either way, `null` means there is no next page. Prefer `cursor` /
  * `iterSearchCases`, which handles both shapes for you.
  */
@@ -78,7 +97,7 @@ export interface KeywordSearchPagination {
  * Pagination shape returned by `POST /search/cases/semantic`.
  *
  * `total` and `totalPages` are estimates, exact only on the last page: the
- * handler fetches `limit + 1` from Qdrant and reports
+ * handler fetches `limit + 1` results and reports
  * `skip + results.length (+1 if more)`.
  */
 export interface SemanticSearchPagination {
@@ -150,9 +169,8 @@ export interface SearchCasesOptions {
    */
   cursor?: string;
   /**
-   * @deprecated Legacy cursor mechanism, honoured only for accounts without
-   * the API self-serve tiers flag on. A JSON encoded array string (the raw
-   * OpenSearch sort tuple from a previous page's `pagination.nextCursor`).
+   * @deprecated Legacy cursor mechanism. A JSON encoded array string (the raw
+   * sort tuple from a previous page's `pagination.nextCursor`).
    * New integrations should use `cursor` instead.
    */
   searchAfter?: string;
@@ -188,21 +206,20 @@ export interface SearchCasesMeta {
 }
 
 /**
- * A raw OpenSearch hit: the `_source` fields for the v3 index, all optional
- * since presence varies per document, plus the hit metadata fields.
+ * A raw search hit: the stored document fields, all optional since presence
+ * varies per document, plus the hit metadata fields.
  *
- * `detailedSummary`, `holding`, `keyFacts_joined`, `legalIssues_joined` and
- * `courtsReasoning` are indexed but excluded from `_source`, so they never
- * appear here.
+ * Analysis fields such as `detailedSummary` and `holding` are never returned
+ * here.
  */
 export interface SearchHit {
   /** The documented contract name for this hit's id. Always present; use this, not `_id`. */
   id: string;
   /** The documented contract name for this hit's relevance score. Always present; use this, not `_score`. */
   score: number;
-  /** Present only when the search backend attached highlighted snippets. Field name to snippet list, OpenSearch's usual highlight shape. */
+  /** Present only when highlighted snippets were attached. Field name to snippet list. */
   highlights?: Record<string, string[]>;
-  /** @deprecated Legacy field name; the OpenSearch microservice's `_source` carries this today, kept for backwards compatibility. Prefer `id`. */
+  /** @deprecated Legacy field name, kept for backwards compatibility. Prefer `id`. */
   _id?: string;
   /** @deprecated Legacy field name, kept for backwards compatibility. Prefer `score`. */
   _score?: number;
@@ -240,12 +257,38 @@ export interface SearchHit {
   precedentValue?: string;
   createdAt?: string;
   updatedAt?: string;
-  /** The mapping documents more fields than any one hit is guaranteed to carry. */
+  /**
+   * Supreme Court only: the other orders and documents of the same matter,
+   * newest first. Each matter appears once, so a page can hold fewer rows
+   * than `limit`: page with the cursor or `hasMore`, not the row count.
+   */
+  sameMatter?: SameMatterEntry[];
+  /** The API can return more fields than any one hit is guaranteed to carry. */
   [key: string]: unknown;
+}
+
+export type SearchCnrLookupStatus = "pending" | "not_found" | "cooldown" | "limit_reached" | "unavailable";
+
+/**
+ * Only on a `cnr` lookup that returned no case: what is happening with the
+ * CNR. `pending`: a check at the court has started, poll `getCaseByCnr`
+ * (Supreme Court checks can take a few minutes). `not_found`: the court has
+ * no case with this CNR. `cooldown`: a recent check failed, try again later.
+ * `limit_reached`: the daily limit for new court checks is used up.
+ * `unavailable`: the check could not run right now.
+ */
+export interface SearchCnrLookup {
+  /** The canonical 16 character CNR. */
+  cnr: string;
+  status: SearchCnrLookupStatus | (string & {});
+  /** Present while `pending`: the court check, as `getCaseByCnr` reports it. */
+  requestId?: string;
 }
 
 export interface SearchCasesResponse extends ApiResponse<SearchHit[], SearchCasesMeta> {
   pagination: KeywordSearchPagination;
+  /** Only on a `cnr` lookup that returned no case. See `SearchCnrLookup`. */
+  cnrLookup?: SearchCnrLookup;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -254,7 +297,7 @@ export interface SearchCasesResponse extends ApiResponse<SearchHit[], SearchCase
 
 /**
  * Free form filter channel actually read by the handler. Filters extracted
- * from the natural language query by GPT are merged with this object, and
+ * from the natural language query by the language model are merged with this object, and
  * values supplied here win. Keys beyond the recognised ones are passed
  * through untouched, hence the index signature.
  */
@@ -278,7 +321,7 @@ export interface SemanticSearchOptions {
   /**
    * Merged into the effective filters at explicit-top-level precedence: it
    * wins over whatever the language model inferred from `query`, but a value
-   * in `filters` (the vector store's own keys, the most specific thing a
+   * in `filters` (the AI search's own filter keys, the most specific thing a
    * caller can send) wins over this.
    */
   court?: StringOrArray;
@@ -303,7 +346,7 @@ export interface SemanticSearchOptions {
   /** 1..100, default 20. */
   limit?: number;
   /**
-   * The vector store's own filter keys, applied directly and taking
+   * The AI search's own filter keys, applied directly and taking
    * precedence over both the top level fields above and whatever the
    * language model inferred from `query`.
    */
@@ -325,8 +368,14 @@ export interface CaseListItem {
   summary?: string;
   hasDocuments?: boolean;
   hasAnalysis?: boolean;
-  /** The Qdrant score. Minimum score threshold is 0.3. */
+  /** The similarity score. Minimum score threshold is 0.3. */
   similarity: number;
+  /**
+   * Supreme Court only: the other orders and documents of the same matter,
+   * newest first. Each matter appears once, so a page can hold fewer rows
+   * than `limit`: page with the cursor or `hasMore`, not the row count.
+   */
+  sameMatter?: SameMatterEntry[];
 }
 
 export interface SemanticSearchMeta {
@@ -344,7 +393,7 @@ export interface SemanticSearchMeta {
    */
   message?: string;
   /** Present only when the cleaned query was too short and the handler fell back to keyword search. */
-  fallbackMode?: "opensearch";
+  fallbackMode?: string;
   /** Present, and `true`, only when one or more results were withheld by the restricted-case gate (a party's takedown, or a masked title). */
   someRecordsWithheld?: boolean;
   /** Present, and `true`, only when the restricted-case check itself could not run (fail-closed masking, not a confirmed clean page). */
@@ -353,8 +402,8 @@ export interface SemanticSearchMeta {
 
 /**
  * `data` is `CaseListItem[]` on the normal and no results paths. On the
- * filter-only fallback path (`meta.fallbackMode === "opensearch"`) it is
- * `SearchHit[]` instead, raw OpenSearch hits, see `searchCases`.
+ * filter-only fallback path (`meta.fallbackMode` is set) it is
+ * `SearchHit[]` instead, raw search hits, see `searchCases`.
  */
 export interface SemanticSearchResponse extends ApiResponse<Array<CaseListItem | SearchHit>, SemanticSearchMeta> {
   pagination: SemanticSearchPagination;
@@ -387,12 +436,128 @@ export interface CaseDetails {
   /** YYYY-MM-DD. */
   nextHearingDate?: string;
   lastListedOn?: string;
+  /** Tribunal cases only: the bench that heard the matter, for example `Delhi` for an appeal heard there. Absent when the record does not name one. */
+  bench?: string;
   orderCount?: number;
   summary?: string;
   metadata?: { diaryNumber?: string };
   hasDocuments?: boolean;
   documentCount?: number;
   hasAnalysis?: boolean;
+  /** Present with `include: ["advocates"]`. Null when we hold no such record. */
+  advocates?: CaseAdvocates | null;
+  /** Present with `include: ["hearings"]`, newest first. Null when we hold no such record. */
+  hearings?: CaseHearing[] | null;
+  hearingCount?: number | null;
+  hearingsTruncated?: boolean;
+  /**
+   * Acts and sections as the court record states them. Present when the
+   * court record lists them and the case is available in full; a district
+   * case that has not been fetched from the court may not carry them yet.
+   * Never present on a protected matter. Separate from `acts` and
+   * `sections`, which come from analysis of the judgment.
+   */
+  courtRecordActs?: CourtRecordAct[];
+  /**
+   * District cases only: the FIR (police station, number and year) as the
+   * court record states it, under the same rule as `courtRecordActs`.
+   */
+  courtRecordFir?: CourtRecordFir[];
+}
+
+export type CaseInclude = "hearings" | "advocates";
+
+export interface CaseAdvocates {
+  petitioner: string[];
+  respondent: string[];
+}
+
+export interface CaseHearing {
+  /** The day the matter was before the court. */
+  businessDate: string | null;
+  /** The next date the court fixed. */
+  hearingDate: string | null;
+  purpose: string | null;
+  judge: string | null;
+  causeListType: string | null;
+}
+
+export interface GetCaseOptions {
+  include?: readonly CaseInclude[];
+  timeoutMs?: number;
+}
+
+export type CaseDocumentKind = "case_document" | "order";
+
+export interface CaseDocumentRow {
+  id: string;
+  kind: CaseDocumentKind;
+  date: string | null;
+  orderNumber: string | null;
+  textAvailable: boolean;
+  /** A PDF of this document can be read through `getCasePdf`, which serves the case document only. */
+  pdfAvailable: boolean;
+  /**
+   * Present only when `textAvailable` is false. `no_text`: no readable text
+   * is held for this document. `not_published`: the text of this case is not
+   * offered on the API.
+   */
+  unavailableReason?: "no_text" | "not_published" | (string & {});
+}
+
+export interface CaseDocuments {
+  caseId: string;
+  documents: CaseDocumentRow[];
+  /** Present, and true, when the text of this case is not offered on the API. Every row then reads `textAvailable: false` and `pdfAvailable: false`. */
+  ordersTextWithheld?: boolean;
+  /** Present with `ordersTextWithheld`. */
+  withheldReason?: "not_published" | (string & {});
+}
+
+export interface CaseDocumentText {
+  caseId: string;
+  documentId: string;
+  kind: CaseDocumentKind;
+  date: string | null;
+  orderNumber: string | null;
+  textAvailable: boolean;
+  text: string | null;
+  textLength: number;
+  /** True when this may be only part of the document. */
+  textTruncated: boolean;
+  pdfAvailable: boolean;
+}
+
+export type CnrRefreshStatus =
+  | "queued"
+  | "running"
+  | "fresh"
+  | "not_found"
+  | "invalid"
+  | "restricted"
+  | "cooldown"
+  | "unsupported"
+  | "unavailable"
+  | "not_accepted";
+
+export interface CnrRefreshResult {
+  input: string;
+  cnr: string | null;
+  status: CnrRefreshStatus;
+  /** Set when `status` is `queued`. */
+  caseId: string | null;
+  lastRefreshedAt: string | null;
+}
+
+export interface CnrRefreshBatch {
+  results: CnrRefreshResult[];
+  summary: { requested: number; started: number };
+}
+
+export interface CnrRefreshState {
+  cnr: string;
+  state: "running" | "idle" | "not_found" | "failed";
+  lastRefreshedAt: string | null;
 }
 
 export interface GetCaseMeta {
@@ -537,7 +702,7 @@ export interface AnalyzeCaseOptions {
   force?: boolean;
   /**
    * Required (`true`) when the only way to analyze this case is fetching its
-   * document from an external URL (no `rawText` and no S3-stored document).
+   * document from an external URL (no `rawText` and no stored document).
    * Not available on the Free tier (`REMOTE_FETCH_NOT_ALLOWED`, 403), and the
    * target host must be on the server's allowlist (also
    * `REMOTE_FETCH_NOT_ALLOWED` when it is not). Adds a credit surcharge on
@@ -553,7 +718,7 @@ export interface AnalyzeCaseStarted {
 
 export interface AnalyzeCaseAlreadyExists {
   message: string;
-  /** Same analysis object as the analysis endpoint, minus the internal analysisModel/analysisVersion/analysisDate/analysisMethod fields. */
+  /** Same analysis object as the analysis endpoint, minus internal metadata. */
   analysis: CaseAnalysisData;
   alreadyExists: true;
 }
@@ -598,8 +763,7 @@ export interface AnalyzeConsolidatedMeta {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Job status values stored on the `case_jobs` record behind the timeline
- * endpoints. `running` only ever appears on GET /get-timeline, never on the
+ * Job status values reported by the timeline endpoints. `running` only ever appears on GET /get-timeline, never on the
  * POST /request-timeline response. The union is widened with `(string & {})`
  * because the job type on the server side is extensible, so a future status
  * will not break type checking for callers.
@@ -715,15 +879,15 @@ export type HealthCheckEntry = HealthCheckResult["status"] | HealthCheckResult;
  * `X-Request-Id` response header. `status` is `"healthy"` on the plain
  * form; the deep form's `status` is one of `"healthy"`, `"degraded"` or
  * `"unhealthy"` (the last one only alongside HTTP 503, meaning a hard
- * dependency - Mongo or OpenSearch - is down).
+ * dependency is down).
  */
 export interface HealthResponse {
   success: boolean;
   status: string;
   version: string;
-  /** The deployed commit SHA, or `null` when the server has no `GIT_SHA` set. */
+  /** The deployed commit SHA, or `null` when the server does not report one. */
   commit?: string | null;
-  /** Present only when `deep: true` was passed: one entry per dependency (Mongo, OpenSearch, Qdrant, Redis, IAM). See `HealthCheckEntry`. */
+  /** Present only when `deep: true` was passed: one entry per dependency. See `HealthCheckEntry`. */
   checks?: Record<string, HealthCheckEntry>;
   timestamp: string;
   requestId?: string;
@@ -805,7 +969,7 @@ export interface PartyScreenConfidence {
   band: PartyScreenBand;
   /** Alias of `calibrated`, kept as a stable top-level "the number" field. */
   score: number;
-  /** The score after calibration against the golden fixture, use this one. */
+  /** The calibrated score, use this one. */
   calibrated: number;
   /** Which resolution engine produced this confidence: `"rules"` for the deterministic resolver, `"llm"` when `adjudicate: true` triggered adjudication for this candidate (or the LLM path degraded and fell back to rules). */
   engine: "rules" | "llm";
@@ -848,6 +1012,25 @@ export interface PartyScreenMatch {
   citation?: string;
   summary?: string;
   casePageUrl?: string;
+  /**
+   * Acts and sections as the court record states them. Present when the
+   * court record lists them and the case is available in full; a district
+   * case that has not been fetched from the court may not carry them yet.
+   * Never present on a protected matter. Separate from `acts` and
+   * `sections`, which come from analysis of the judgment.
+   */
+  courtRecordActs?: CourtRecordAct[];
+  /**
+   * District cases only: the FIR (police station, number and year) as the
+   * court record states it, under the same rule as `courtRecordActs`.
+   */
+  courtRecordFir?: CourtRecordFir[];
+  /**
+   * Supreme Court only: the other orders and documents of the same matter,
+   * newest first. Each matter appears once, so a page can hold fewer rows
+   * than `limit`: page with the cursor or `hasMore`, not the row count.
+   */
+  sameMatter?: SameMatterEntry[];
   partyRole: PartyRole;
   confidence: PartyScreenConfidence;
   evidence: PartyScreenEvidence;
@@ -856,11 +1039,15 @@ export interface PartyScreenMatch {
 
 /**
  * The plain case fields only: everything on `PartyScreenMatch` except
- * `partyRole`, `confidence`, `evidence` and `rationale`. A candidate the
+ * `partyRole`, `confidence`, `evidence`, `rationale` and the court record
+ * fields (`courtRecordActs`, `courtRecordFir`, `sameMatter`). A candidate the
  * screen found but could not confidently confirm, below `displayThreshold`
  * or withheld from full confidence scoring for another reason.
  */
-export type PartyScreenRelatedMatch = Omit<PartyScreenMatch, "partyRole" | "confidence" | "evidence" | "rationale">;
+export type PartyScreenRelatedMatch = Omit<
+  PartyScreenMatch,
+  "partyRole" | "confidence" | "evidence" | "rationale" | "courtRecordActs" | "courtRecordFir" | "sameMatter"
+>;
 
 export interface PartyScreenByBand {
   confirmed: number;
@@ -965,7 +1152,7 @@ export interface PartyScreenMeta {
 export interface CoverageByCourtType {
   courtType: string;
   records: number;
-  documentBearing: number;
+  documentBearing?: number;
   latestDecisionDate?: string | null;
 }
 
@@ -979,36 +1166,31 @@ export interface CoverageCourt {
   /** Nullable as of 2026-09-19 (live-verified: still populated for every observed row, but the spec now allows `null`). */
   courtType: string | null;
   records: number;
-  documentBearing: number;
+  documentBearing?: number;
   earliestDecisionDate?: string | null;
   latestDecisionDate?: string | null;
-  /** How many business days behind live filings this court's index appears to be. Null when it cannot be computed. */
+  /** How many business days behind live filings this court's records appear to be. Null when it cannot be computed. */
   businessDaysBehind?: number | null;
 }
 
-/** District Courts are reported as a single rolled up row, the index has no per-state field. */
+/** District Courts are reported as a single rolled up row. */
 export interface CoverageDistrictCourts {
   records: number;
-  documentBearing: number;
+  documentBearing?: number;
   latestDecisionDate?: string | null;
   businessDaysBehind?: number | null;
 }
 
 /**
- * Only these fields are ever returned - the server's `sanitizeCoverageResponse`
- * strips every other field the raw OpenSearch coverage response carries
- * (operational bookkeeping such as `byYearMissing`, `sumOtherDocCount`,
- * `docCountErrorUpperBound`, an upstream `ageSeconds`, and the refresh job's
- * own job status) before this is ever cached or served - confirmed against
- * the redeployed OpenAPI spec and a live call 2026-09-19.
+ * Only these fields are ever returned.
  */
 export interface CoverageData {
   generatedAt: string;
-  /** The OpenSearch index this snapshot was counted from, for example `"courtmesh_cases_v3"`. */
+  /** An opaque label for the snapshot these figures were counted from. Two snapshots with the same label share a source. */
   index: string;
   total: number;
-  documentBearing: number;
-  statusOnly: number;
+  documentBearing?: number;
+  statusOnly?: number;
   byCourtType: CoverageByCourtType[];
   byYear: CoverageByYear[];
   courts: CoverageCourt[];
@@ -1052,21 +1234,14 @@ export interface UsageBalance {
 }
 
 /**
- * Mirrors the server's `TierLimits` (server/config/api-tiers.ts). `-1` means
+ * Mirrors the per tier limits the API reports. `-1` means
  * unlimited on any per period field for a tier that has a numbered cap.
  *
- * `limits` itself is always a populated object (verified live and in the
- * redeployed OpenAPI spec, `data.limits` is `required` and never `null`).
- * Live-verified 2026-09-19 on an Enterprise key with the API self-serve
- * tiers flag off: `requestsPerMinute` is 10, the flat legacy ceiling
- * actually enforced right now (matches `X-RateLimit-Limit`); `published` is
- * this tier's documented number (600 for enterprise) from the "Rate limits
- * and per-IP limits" table, whether or not it is the one enforced yet; and
- * every other field came back `null`, not `-1` and not `true`/`false` - this
- * tier apparently has no configured cap at all for those fields with the
- * flag off. `requestsPerMinute` and `published` converge once self serve
- * tiers are enabled. Every field except `requestsPerMinute` and `published`
- * is typed nullable to match; treat `null` the same as `-1`/unlimited (or
+ * `limits` itself is always a populated object, `data.limits` is `required`
+ * and never `null`. `requestsPerMinute` is the limit applied to this key
+ * (matches `X-RateLimit-Limit`); `published` is this tier's documented number
+ * from the "Rate limits and per-IP limits" table.
+ * Every field except `requestsPerMinute` and `published` is typed nullable; treat `null` the same as `-1`/unlimited (or
  * "allowed") unless you have evidence a given tier distinguishes the two.
  */
 export interface UsageTierLimits {
@@ -1085,7 +1260,7 @@ export interface UsageTierLimits {
   liveFetchesPerDay: number | null;
   analysisReadAllowed: boolean | null;
   partyScreensPerMonth: number | null;
-  /** This tier's number in the OpenAPI rate-limit table, whether or not it is the one `requestsPerMinute` currently enforces. Added 2026-09-19. */
+  /** This tier's number in the OpenAPI rate-limit table. Added 2026-09-19. */
   published: number;
 }
 
@@ -1116,7 +1291,7 @@ export interface UsageData {
 
 export interface UsageMeta {
   requestId: string;
-  /** Live-verified 2026-09-19, undocumented until now: whether this account is on the API self-serve tiers flag. */
+  /** Whether this account is self serve. */
   selfServe?: boolean;
 }
 
@@ -1186,7 +1361,7 @@ export interface AuditSummary {
   totalAiAnalysisHits: number;
   avgResponseTime: number;
   successfulHits: number;
-  /** A string, e.g. `"98.5"` - the server formats it with `toFixed(1)`. */
+  /** A string, e.g. `"98.5"` with one decimal place. */
   successRate: string;
   totalCreditsDeducted: number;
 }
@@ -1210,6 +1385,34 @@ export interface AuditResponse {
   data: AuditData;
   pagination: AuditPagination;
   requestId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* DELETE /audit                                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface DeleteAuditActivityOptions {
+  /**
+   * Required. A full date and time with `Z` or an offset, for example
+   * `2026-11-05T00:00:00Z`, or a `Date`. Not in the future. Activity of the
+   * calling API key before this time is deleted.
+   */
+  before: string | Date;
+}
+
+export interface DeleteAuditActivityResult {
+  /** The time used, in UTC. */
+  before: string;
+  /** Calls removed from `audit()` by this request. */
+  removed: number;
+  /** False when part is left: send the same request again to finish. */
+  complete: boolean;
+  note: string;
+}
+
+export interface DeleteAuditActivityMeta {
+  creditsCharged?: number;
+  metered?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */

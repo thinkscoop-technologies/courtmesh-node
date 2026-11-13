@@ -108,7 +108,7 @@ describe("2. searchCases", () => {
     expect(pages).toEqual(["1", "2"]);
   });
 
-  it("walks pages with iterSearchCases using the signed cursor (self-serve on)", async () => {
+  it("walks pages with iterSearchCases using the signed cursor", async () => {
     const { client, calls } = makeClient([
       {
         status: 200,
@@ -174,11 +174,11 @@ describe("3. semanticSearch", () => {
 
   it("throws CourtMeshError when the HTTP 200 body has success: false", async () => {
     const { client } = makeClient([
-      { status: 200, body: { success: false, error: "Failed to generate query embedding" } },
+      { status: 200, body: { success: false, error: "Semantic search failed" } },
     ]);
     const error = await client.semanticSearch({ query: "abc" }).catch((e) => e);
     expect(error).toBeInstanceOf(CourtMeshError);
-    expect(error.message).toBe("Failed to generate query embedding");
+    expect(error.message).toBe("Semantic search failed");
     expect(error.statusCode).toBe(200);
   });
 
@@ -606,7 +606,7 @@ describe("13. screenParty", () => {
     ]);
 
     const result = await client.screenParty(
-      { name: "Poojitha", entityType: "person", purpose: "research" },
+      { name: "Testname", entityType: "person", purpose: "research" },
       { idempotencyKey: "same-key" },
     );
 
@@ -625,24 +625,21 @@ describe("14. coverage", () => {
           success: true,
           data: {
             generatedAt: "2026-09-18T00:00:00.000Z",
-            index: "courtmesh_cases_v3",
-            total: 315_600_000,
-            documentBearing: 12_000_000,
-            statusOnly: 303_600_000,
-            byCourtType: [{ courtType: "High Court", records: 40_000_000, documentBearing: 8_000_000, latestDecisionDate: "2026-09-17" }],
-            byYear: [{ year: 2026, records: 1_200_000 }],
+            index: "corpus-0123456789ab",
+            total: 1_000,
+            byCourtType: [{ courtType: "High Court", records: 400, latestDecisionDate: "2026-09-17" }],
+            byYear: [{ year: 2026, records: 120 }],
             courts: [
               {
                 court: "Delhi High Court",
                 courtType: "High Court",
-                records: 2_000_000,
-                documentBearing: 500_000,
+                records: 200,
                 earliestDecisionDate: "1950-01-01",
                 latestDecisionDate: "2026-09-17",
                 businessDaysBehind: 1,
               },
             ],
-            districtCourts: { records: 300_000_000, documentBearing: 1_000_000, latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
+            districtCourts: { records: 500, latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
           },
           meta: {
             generatedAt: "2026-09-18T00:00:00.000Z",
@@ -659,8 +656,8 @@ describe("14. coverage", () => {
 
     const result = await client.coverage();
 
-    expect(result.data.total).toBe(315_600_000);
-    expect(result.data.districtCourts.records).toBe(300_000_000);
+    expect(result.data.total).toBe(1_000);
+    expect(result.data.districtCourts.records).toBe(500);
     expect(result.meta?.cacheTtlSeconds).toBe(21600);
     expect(result.meta?.snapshotAgeSeconds).toBe(2145);
     expect(result.meta?.cacheAgeSeconds).toBe(712);
@@ -678,14 +675,12 @@ describe("14. coverage", () => {
           success: true,
           data: {
             generatedAt: "2026-09-18T00:00:00.000Z",
-            index: "courtmesh_cases_v3",
+            index: "corpus-0123456789ab",
             total: 1,
-            documentBearing: 1,
-            statusOnly: 0,
             byCourtType: [],
             byYear: [],
             courts: [],
-            districtCourts: { records: 0, documentBearing: 0 },
+            districtCourts: { records: 0 },
           },
           meta: {
             generatedAt: "2026-09-18T00:00:00.000Z",
@@ -735,23 +730,21 @@ describe("15. usage", () => {
     expect(calls[0]?.url).toContain("/usage");
   });
 
-  it("accepts the live shape: an Enterprise key's uncapped limits are null, plus published, and meta.selfServe", async () => {
-    // Live-verified 2026-09-19 against the redeployed server: `limits` is
-    // always a populated object (never null itself). Every field but
-    // requestsPerMinute and the new `published` came back null (not -1, not
-    // true/false) for an Enterprise key with the self-serve tiers flag off,
-    // and meta carried an undocumented selfServe flag.
+  it("accepts the live shape: null limit fields, plus published, and meta.selfServe", async () => {
+    // `limits` is always a populated object (never null itself). Every field
+    // but requestsPerMinute and `published` can come back null (not -1, not
+    // true/false), and meta can carry selfServe.
     const { client } = makeClient([
       {
         status: 200,
         body: {
           success: true,
           data: {
-            tier: "enterprise",
+            tier: "payg",
             walletOwner: { type: "user", id: "u1" },
             balance: { total: 0, monthlyGrant: 0, signupGrant: 0, purchased: 0 },
             limits: {
-              requestsPerMinute: 10,
+              requestsPerMinute: 30,
               requestsPerDay: null,
               requestsPerMonth: null,
               maxPageSize: null,
@@ -766,25 +759,25 @@ describe("15. usage", () => {
               liveFetchesPerDay: null,
               analysisReadAllowed: null,
               partyScreensPerMonth: null,
-              published: 600,
+              published: 60,
             },
             period: { start: "2026-08-31T18:30:00.000Z", end: "2026-09-30T18:29:59.999Z", key: "2026-09" },
             creditsUsedThisPeriod: 0,
             byEndpoint: [],
             subscriptionRenewsAt: null,
           },
-          meta: { requestId: "req-usage-2", selfServe: false },
+          meta: { requestId: "req-usage-2", selfServe: true },
         },
       },
     ]);
 
     const result = await client.usage();
 
-    expect(result.data.limits.requestsPerMinute).toBe(10);
+    expect(result.data.limits.requestsPerMinute).toBe(30);
     expect(result.data.limits.requestsPerDay).toBeNull();
     expect(result.data.limits.semanticSearchAllowed).toBeNull();
-    expect(result.data.limits.published).toBe(600);
-    expect(result.meta?.selfServe).toBe(false);
+    expect(result.data.limits.published).toBe(60);
+    expect(result.meta?.selfServe).toBe(true);
   });
 });
 
@@ -809,15 +802,15 @@ describe("16. health(deep)", () => {
           status: "degraded",
           version: "1.0.0",
           commit: "abc123",
-          checks: { mongo: { status: "ok", latencyMs: 12 }, opensearch: { status: "degraded", latencyMs: 900 } },
+          checks: { database: { status: "ok", latencyMs: 12 }, search: { status: "degraded", latencyMs: 900 } },
           timestamp: "2026-09-18T00:00:00.000Z",
         },
       },
     ]);
     const result = await client.health({ deep: true });
     expect(result.status).toBe("degraded");
-    const opensearch = result.checks?.opensearch;
-    expect(typeof opensearch === "object" && opensearch?.status).toBe("degraded");
+    const search = result.checks?.search;
+    expect(typeof search === "object" && search?.status).toBe("degraded");
     expect(calls[0]?.url).toContain("deep=1");
   });
 
@@ -833,14 +826,14 @@ describe("16. health(deep)", () => {
           success: true,
           status: "healthy",
           version: "1.2.0",
-          checks: { mongo: "ok", opensearch: "ok", qdrant: "ok", redis: "ok", iam: "ok" },
+          checks: { database: "ok", search: "ok", aiSearch: "ok", cache: "ok", identity: "ok" },
           timestamp: "2026-09-18T20:14:22.870Z",
         },
       },
     ]);
     const result = await client.health({ deep: true });
-    expect(result.checks?.mongo).toBe("ok");
-    expect(result.checks?.opensearch).toBe("ok");
+    expect(result.checks?.database).toBe("ok");
+    expect(result.checks?.search).toBe("ok");
   });
 });
 
@@ -907,7 +900,7 @@ describe("18. audit", () => {
                 responseTime: 2,
                 createdAt: "2026-09-18T00:00:00.000Z",
                 metadata: null,
-                ipHash: "4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f",
+                ipHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
               },
             ],
             summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 2, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 0 },
@@ -920,7 +913,7 @@ describe("18. audit", () => {
 
     const result = await client.audit();
 
-    expect(result.data.hits[0]?.ipHash).toBe("4173bdfd6267defad05aa48fdf5d69b0cb45293f2f7e5de9665b20a0df9f5e5f");
+    expect(result.data.hits[0]?.ipHash).toBe("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     expect(result.data.hits[0]?.metadata).toBeNull();
     expect("userAgent" in (result.data.hits[0] ?? {})).toBe(false);
   });

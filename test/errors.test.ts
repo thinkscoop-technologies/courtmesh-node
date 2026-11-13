@@ -147,7 +147,7 @@ describe("error class mapping", () => {
 
   it("408 -> RequestTimeoutError", async () => {
     const { client } = makeClient([
-      { status: 408, body: { success: false, error: "Request timeout - OpenSearch query took too long" } },
+      { status: 408, body: { success: false, error: "Request timeout - search took too long" } },
     ]);
     const error = await client.searchCases({ query: "x" }).catch((e) => e);
     expect(error).toBeInstanceOf(RequestTimeoutError);

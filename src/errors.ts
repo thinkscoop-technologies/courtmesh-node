@@ -22,12 +22,12 @@ export type CourtMeshErrorCode =
   | "unknown_error";
 
 /**
- * Mirrors `API_REFUSAL_CODES` from the research server
- * (server/config/api-tiers.ts), plus the handler-local machine codes used
+ * Mirrors the API's machine refusal codes, plus the handler-local machine
+ * codes used
  * outside that table (`CASE_RESTRICTED`, `PDF_NOT_STORED`, `CASE_NOT_FOUND`,
  * `PARTY_SCREEN_SEARCH_DEGRADED`, `ENTITLEMENT_UNAVAILABLE`, `CURSOR_INVALID`,
- * `PAGE_LIMIT_EXCEEDED`, `PAGINATION_DEPTH_EXCEEDED`, the abuse-control and
- * auth codes, and the JSON/body-parser codes this SDK synthesises client
+ * `PAGE_LIMIT_EXCEEDED`, `PAGINATION_DEPTH_EXCEEDED`, the tier limit and
+ * auth codes, and the malformed body codes this SDK synthesises client
  * side, since the server itself does not attach a `code` field to those).
  *
  * This is a plain string union rather than a closed enum: the server adds
@@ -49,6 +49,10 @@ export type ApiRefusalCode =
   | "LIVE_FETCH_LIMIT_REACHED"
   | "DISTINCT_CASES_LIMIT_REACHED"
   | "PDF_LIMIT_REACHED"
+  | "ORDER_TEXT_LIMIT_REACHED"
+  | "DOCUMENT_NOT_FOUND"
+  | "REFRESH_QUEUE_BUSY"
+  | "COURT_SOURCE_UNAVAILABLE"
   | "TOO_MANY_KEYS_FROM_IP"
   | "EMAIL_NOT_VERIFIED"
   | "CONCURRENT_ANALYSIS_LIMIT"
@@ -85,13 +89,19 @@ export type ApiRefusalCode =
   | "WATCH_CAP_EXCEEDED"
   | "WATCHLIST_LIMIT_REACHED"
   | "WEBHOOK_LIMIT_REACHED"
-  | "INVALID_WEBHOOK_URL";
+  | "INVALID_WEBHOOK_URL"
+  | "ACT_NOT_FOUND"
+  | "SECTION_NOT_FOUND"
+  | "UPSTREAM_UNAVAILABLE"
+  | "SETTLEMENT_UNCONFIRMED"
+  | "PARTY_PROFILE_FULL_UNAVAILABLE"
+  | "PARTY_PROFILE_TOO_MANY_ACTIVE";
 
 /**
- * Runtime mirror of `API_REFUSAL_CODES` (server/config/api-tiers.ts) plus the
+ * Runtime mirror of the API's machine refusal codes plus the
  * handler-local and SDK-synthesised codes listed on `ApiRefusalCode` above.
  * Kept as a plain object (not a TS `enum`) so it tree shakes and compares by
- * value, exactly like the server's own `as const` object.
+ * value, exactly like the API's own codes.
  */
 export const API_REFUSAL_CODES = {
   ENTERPRISE_ONLY: "API_ENTERPRISE_ONLY",
@@ -108,6 +118,10 @@ export const API_REFUSAL_CODES = {
   LIVE_FETCH_LIMIT_REACHED: "LIVE_FETCH_LIMIT_REACHED",
   DISTINCT_CASES_LIMIT_REACHED: "DISTINCT_CASES_LIMIT_REACHED",
   PDF_LIMIT_REACHED: "PDF_LIMIT_REACHED",
+  ORDER_TEXT_LIMIT_REACHED: "ORDER_TEXT_LIMIT_REACHED",
+  DOCUMENT_NOT_FOUND: "DOCUMENT_NOT_FOUND",
+  REFRESH_QUEUE_BUSY: "REFRESH_QUEUE_BUSY",
+  COURT_SOURCE_UNAVAILABLE: "COURT_SOURCE_UNAVAILABLE",
   TOO_MANY_KEYS_FROM_IP: "TOO_MANY_KEYS_FROM_IP",
   EMAIL_NOT_VERIFIED: "EMAIL_NOT_VERIFIED",
   CONCURRENT_ANALYSIS_LIMIT: "CONCURRENT_ANALYSIS_LIMIT",
@@ -145,6 +159,12 @@ export const API_REFUSAL_CODES = {
   WATCHLIST_LIMIT_REACHED: "WATCHLIST_LIMIT_REACHED",
   WEBHOOK_LIMIT_REACHED: "WEBHOOK_LIMIT_REACHED",
   INVALID_WEBHOOK_URL: "INVALID_WEBHOOK_URL",
+  ACT_NOT_FOUND: "ACT_NOT_FOUND",
+  SECTION_NOT_FOUND: "SECTION_NOT_FOUND",
+  UPSTREAM_UNAVAILABLE: "UPSTREAM_UNAVAILABLE",
+  SETTLEMENT_UNCONFIRMED: "SETTLEMENT_UNCONFIRMED",
+  PARTY_PROFILE_FULL_UNAVAILABLE: "PARTY_PROFILE_FULL_UNAVAILABLE",
+  PARTY_PROFILE_TOO_MANY_ACTIVE: "PARTY_PROFILE_TOO_MANY_ACTIVE",
 } as const satisfies Record<string, ApiRefusalCode>;
 
 const DAILY_CAP_429_CODES: ReadonlySet<string> = new Set([
@@ -152,6 +172,7 @@ const DAILY_CAP_429_CODES: ReadonlySet<string> = new Set([
   API_REFUSAL_CODES.LIVE_FETCH_LIMIT_REACHED,
   API_REFUSAL_CODES.DISTINCT_CASES_LIMIT_REACHED,
   API_REFUSAL_CODES.PDF_LIMIT_REACHED,
+  API_REFUSAL_CODES.ORDER_TEXT_LIMIT_REACHED,
   API_REFUSAL_CODES.TOO_MANY_KEYS_FROM_IP,
 ]);
 
@@ -179,8 +200,7 @@ export interface CourtMeshErrorExtra {
    */
   apiCode?: string;
   /**
-   * Echoed from the server's `requestId` field (sent once the API's
-   * `X-Request-Id` middleware ships) or, failing that, the `X-Request-Id`
+   * Echoed from the server's `requestId` field or, failing that, the `X-Request-Id`
    * response header, when either is present. Undefined on older server
    * builds that do not yet send one.
    */
@@ -224,7 +244,7 @@ export class CourtMeshError extends Error {
  * (`PAGE_LIMIT_EXCEEDED`/`PAGINATION_DEPTH_EXCEEDED`).
  *
  * `details` mirrors the server's `details` array when present (the generic
- * zod validation failure shape). `limit` and `tier` are populated for the
+ * validation failure shape). `limit` and `tier` are populated for the
  * two pagination cap codes, whose response body carries no `error`/`message`
  * field at all (`{ success: false, code, limit, tier }`) - `message` is
  * synthesised from `code` in that case, see `mapStatusToError`.
@@ -327,7 +347,7 @@ export class ConflictError extends CourtMeshError {
   }
 }
 
-/** 408, the OpenSearch query took too long, or the SDK's own client side timeout fired. */
+/** 408, the search took too long, or the SDK's own client side timeout fired. */
 export class RequestTimeoutError extends CourtMeshError {
   constructor(message: string, body: unknown, extra: CourtMeshErrorExtra = {}) {
     super(message, "request_timeout", 408, body, extra);
@@ -436,7 +456,15 @@ export class BadGatewayError extends CourtMeshError {
   }
 }
 
-/** 503, account standing could not be verified (`ENTITLEMENT_UNAVAILABLE`), or the service is otherwise unavailable. Safe to retry. */
+/**
+ * 503. `apiCode` `ENTITLEMENT_UNAVAILABLE`: account standing could not be
+ * verified, nothing ran, safe to retry. `SETTLEMENT_UNCONFIRMED` (the cause
+ * list check): the answer was ready but the charge could not be confirmed and
+ * no results were returned. The charge outcome is unknown, so this is never
+ * retried automatically: check your balance (`usage()`) first. A retry with
+ * the same `Idempotency-Key` is refused with 409 `IDEMPOTENCY_IN_PROGRESS`
+ * for up to 24 hours. Any other 503 is the service being unavailable.
+ */
 export class ServiceUnavailableError extends CourtMeshError {
   constructor(message: string, body: unknown, extra: CourtMeshErrorExtra = {}) {
     super(message, "service_unavailable", 503, body, extra);
@@ -487,7 +515,7 @@ function booleanField(body: unknown, key: string): boolean | undefined {
 /**
  * Synthesise a human message for a body that carries a machine `code` but no
  * `error`/`message` field of its own - today only the two tier pagination
- * caps (`middleware/api-tier-limits.ts`'s `enforceTierQueryLimits`), whose
+ * caps, whose
  * response is deliberately `{ success: false, code, limit, tier }`.
  */
 function synthesizeMessageFromCode(code: string, body: unknown): string {
@@ -503,7 +531,7 @@ function synthesizeMessageFromCode(code: string, body: unknown): string {
   }
 }
 
-/** Looks like the body-parser `entity.parse.failed`/`SyntaxError` message for a malformed JSON request body. */
+/** Looks like the server's message for a malformed JSON request body. */
 function looksLikeMalformedJson(message: string | undefined): boolean {
   if (!message) return false;
   const m = message.toLowerCase();
