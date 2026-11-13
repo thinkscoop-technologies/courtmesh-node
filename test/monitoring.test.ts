@@ -7,7 +7,7 @@ import { queueFetch } from "./helpers.js";
 
 const API_KEY = "cm-abcdefghij1234567890abcdefghijkl-wxyz";
 const BASE = "https://research.courtmesh.ai/api/v1/prod";
-const CNR = "DLHC010084212021";
+const CNR = "ZZAB010000012024";
 
 function makeClient(entries: Parameters<typeof queueFetch>[0], overrides: Record<string, unknown> = {}) {
   const { fetch, calls } = queueFetch(entries);
@@ -21,33 +21,76 @@ const list = (data: unknown[], nextCursor: string | null, extra: Record<string, 
 
 describe("normalizeCnr", () => {
   it.each([
-    ["DLHC010084212021", CNR],
-    ["  dlhc010084212021 ", CNR],
-    ["CNR: DLHC-01-008421-2021", CNR],
-    ["CNR DLHC01 008421 2021", CNR],
-    ["CNR NO DLHC010084212021", CNR],
-    ["cnr:dlhc/01/008421/2021", CNR],
-    ["DLHC.01.008421.2021", CNR],
-    ["WBCHCA0113712023", "WBCHCA0113712023"],
+    ["ZZAB010000012024", CNR],
+    ["  zzab010000012024 ", CNR],
+    ["CNR: ZZAB-01-000001-2024", CNR],
+    ["CNR ZZAB01 000001 2024", CNR],
+    ["CNR NO ZZAB010000012024", CNR],
+    ["cnr:zzab/01/000001/2024", CNR],
+    ["ZZAB.01.000001.2024", CNR],
+    ["ZZABCD0000012024", "ZZABCD0000012024"],
   ])("%s", (input, expected) => {
     expect(normalizeCnr(input)).toBe(expected);
   });
 
   it("rejects things that cannot be a CNR", () => {
     expect(normalizeCnr("")).toBeNull();
-    expect(normalizeCnr("DLHC01008421202")).toBeNull();
-    expect(normalizeCnr("DLHC0100842120211")).toBeNull();
+    expect(normalizeCnr("ZZAB01000001202")).toBeNull();
+    expect(normalizeCnr("ZZAB0100000120241")).toBeNull();
     expect(normalizeCnr("1234567890123456")).toBeNull();
     expect(normalizeCnr(undefined)).toBeNull();
     expect(() => assertCnr("nope")).toThrow(TypeError);
-    expect(assertCnr("cnr: dlhc010084212021")).toBe(CNR);
+    expect(assertCnr("cnr: zzab010000012024")).toBe(CNR);
+  });
+});
+
+describe("case depth and refresh", () => {
+  it("sends include on getCase and getCaseByCnr, and nothing without it", async () => {
+    const { client, calls } = makeClient([ok({ id: "c1" }), ok({ id: "c1" }), ok({ cnr: CNR, status: "found" }), ok({ cnr: CNR, status: "found" })]);
+    await client.getCase("c1");
+    await client.getCase("c1", { include: ["hearings", "advocates"] });
+    await client.getCaseByCnr(CNR, { include: ["hearings"] });
+    await client.getCaseByCnr(CNR, { fetch: true, include: ["advocates"] });
+    expect(calls[0]?.url).toBe(`${BASE}/cases/c1`);
+    expect(decodeURIComponent(calls[1]?.url ?? "")).toBe(`${BASE}/cases/c1?include=hearings,advocates`);
+    expect(calls[2]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?include=hearings`);
+    expect(calls[3]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}?fetch=true&include=advocates`);
+  });
+
+  it("reads the orders and text of a case", async () => {
+    const { client, calls } = makeClient([
+      ok({ caseId: "c1", documents: [] }),
+      ok({ caseId: "c1", documentId: "d1", textAvailable: false, text: null }),
+    ]);
+    await client.listCaseOrders("c1");
+    const text = await client.getCaseDocumentText("c1", "d1");
+    expect(calls[0]?.url).toBe(`${BASE}/cases/c1/orders`);
+    expect(calls[1]?.url).toBe(`${BASE}/cases/c1/orders/d1/text`);
+    expect(text.data.textAvailable).toBe(false);
+  });
+
+  it("refreshes by CNR, reads the state and sends a normalised batch", async () => {
+    const { client, calls } = makeClient([
+      { status: 202, body: { success: true, data: { input: CNR, cnr: CNR, status: "queued", caseId: "c1", lastRefreshedAt: null } } },
+      ok({ cnr: CNR, state: "running", lastRefreshedAt: null }),
+      ok({ results: [], summary: { requested: 1, started: 0 } }),
+    ]);
+    const res = await client.refreshCaseByCnr("cnr: zzab-01-000001-2024");
+    await client.getCaseRefreshState(CNR);
+    await client.refreshCasesBatch(["zzab-01-000001-2024", "junk"]);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}/refresh`);
+    expect(res.data.status).toBe("queued");
+    expect(calls[1]?.method).toBe("GET");
+    expect(calls[2]?.url).toBe(`${BASE}/cases/refresh/batch`);
+    expect(calls[2]?.body).toEqual({ cnrs: [CNR, "junk"] });
   });
 });
 
 describe("getCaseByCnr", () => {
   it("normalises the CNR and returns a found record", async () => {
     const { client, calls } = makeClient([ok({ cnr: CNR, status: "found", case: { id: "c1" }, requestId: null })]);
-    const res = await client.getCaseByCnr("CNR: DLHC-01-008421-2021");
+    const res = await client.getCaseByCnr("CNR: ZZAB-01-000001-2024");
     expect(calls[0]?.method).toBe("GET");
     expect(calls[0]?.url).toBe(`${BASE}/cases/by-cnr/${CNR}`);
     expect(res.data.status).toBe("found");
@@ -83,7 +126,7 @@ describe("searchCases with cnr", () => {
     const { client, calls } = makeClient([
       { status: 200, body: { success: true, data: [], meta: {}, pagination: { hasMore: false, nextCursor: null } } },
     ]);
-    await client.searchCases({ cnr: "cnr: dlhc010084212021" });
+    await client.searchCases({ cnr: "cnr: zzab010000012024" });
     expect(calls[0]?.body).toEqual({ cnr: CNR });
   });
 });
@@ -93,7 +136,7 @@ describe("watchlists", () => {
     const { client, calls } = makeClient([
       ok({ id: "wl_1", name: "Loans", itemCount: 1, createdAt: "t", updatedAt: "t", results: [{ cnr: CNR, result: "watching" }] }),
     ]);
-    const res = await client.createWatchlist({ name: "Loans", items: [{ cnr: "dlhc-010084-212021", reference: "LOAN-42" }] });
+    const res = await client.createWatchlist({ name: "Loans", items: [{ cnr: "zzab-010000-012024", reference: "LOAN-42" }] });
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.url).toBe(`${BASE}/watchlists`);
     expect(calls[0]?.body).toEqual({ name: "Loans", items: [{ cnr: CNR, reference: "LOAN-42" }] });
@@ -144,7 +187,7 @@ describe("watchlists", () => {
     const { client, calls } = makeClient([
       ok({ results: [{ cnr: CNR, result: "pending" }, { cnr: "BAD", result: "invalid", message: "x" }] }),
     ]);
-    const res = await client.addWatchlistItems("wl_1", [{ cnr: "DLHC010084212021" }, { cnr: "BAD" }]);
+    const res = await client.addWatchlistItems("wl_1", [{ cnr: "ZZAB010000012024" }, { cnr: "BAD" }]);
     expect(calls[0]?.url).toBe(`${BASE}/watchlists/wl_1/items`);
     expect(calls[0]?.body).toEqual({ items: [{ cnr: CNR }, { cnr: "BAD" }] });
     expect(res.data.results[1]?.result).toBe("invalid");
@@ -161,7 +204,7 @@ describe("watchlists", () => {
 
   it("removeWatchlistItem deletes by normalised CNR", async () => {
     const { client, calls } = makeClient([ok({ deleted: true })]);
-    await client.removeWatchlistItem("wl_1", "cnr dlhc010084212021");
+    await client.removeWatchlistItem("wl_1", "cnr zzab010000012024");
     expect(calls[0]?.method).toBe("DELETE");
     expect(calls[0]?.url).toBe(`${BASE}/watchlists/wl_1/items/${CNR}`);
   });
@@ -187,7 +230,7 @@ describe("change feed", () => {
     const res = await client.listChanges({
       since: "2026-11-01T00:00:00Z",
       types: ["case.order_added", "case.disposed"],
-      cnr: "dlhc010084212021",
+      cnr: "zzab010000012024",
       limit: 100,
     });
     const url = new URL(calls[0]!.url);
@@ -319,10 +362,10 @@ describe("HTTP layer", () => {
     expect(patch.calls).toHaveLength(1);
   });
 
-  it("sends the 0.5.0 user agent", async () => {
+  it("sends the 0.6.0 user agent", async () => {
     const { client, calls } = makeClient([ok({ id: "wh_1" })]);
     await client.getWebhook("wh_1");
-    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.5.0");
+    expect(calls[0]?.headers["user-agent"]).toBe("courtmesh-node/0.6.0");
   });
 });
 
@@ -429,12 +472,12 @@ describe("final server behaviour", () => {
       ok({
         results: [
           { cnr: CNR, result: "cap_exceeded", message: "The daily limit for adding case numbers has been reached. It resets at midnight IST." },
-          { cnr: "DLHC010084212022", result: "not_found", message: "eCourts had no such case when we last looked. Try again tomorrow." },
+          { cnr: "ZZAB010000022024", result: "not_found", message: "eCourts had no such case when we last looked. Try again tomorrow." },
         ],
         itemCount: 3,
       }),
     ]);
-    const res = await client.addWatchlistItems("wl_1", [{ cnr: CNR }, { cnr: "DLHC010084212022" }]);
+    const res = await client.addWatchlistItems("wl_1", [{ cnr: CNR }, { cnr: "ZZAB010000022024" }]);
     expect(res.data.results.map((r) => r.result)).toEqual(["cap_exceeded", "not_found"]);
   });
 

@@ -3,6 +3,7 @@
  * helpers that do not need a network call: `normalizeCnr` and
  * `verifyWebhookSignature`.
  */
+import type { CaseDetails, CaseInclude } from "./types.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /* -------------------------------------------------------------------------- */
@@ -12,7 +13,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 /**
  * A canonical CNR is 16 characters: a 6 character establishment code that
  * begins with a 2 letter state code (almost always 4 letters then 2 digits,
- * for example `DLHC01`), 6 serial digits and a 4 digit year.
+ * for example `ZZAB01`), 6 serial digits and a 4 digit year.
  */
 const CNR_PATTERN = /^[A-Z]{2}[A-Z0-9]{4}[0-9]{10}$/;
 
@@ -26,7 +27,7 @@ const CNR_PATTERN = /^[A-Z]{2}[A-Z0-9]{4}[0-9]{10}$/;
  * spending a request.
  *
  * @example
- * normalizeCnr("CNR: DLHC-01-008421-2021"); // "DLHC010084212021"
+ * normalizeCnr("CNR: ZZAB-01-000001-2024"); // "ZZAB010000012024"
  */
 export function normalizeCnr(input: unknown): string | null {
   if (typeof input !== "string") return null;
@@ -43,7 +44,7 @@ export function normalizeCnr(input: unknown): string | null {
 export function assertCnr(input: unknown): string {
   const cnr = normalizeCnr(input);
   if (cnr === null) {
-    throw new TypeError("Not a valid CNR: expected 16 characters, for example DLHC010084212021.");
+    throw new TypeError("Not a valid CNR: expected 16 characters, for example ZZAB010000012024.");
   }
   return cnr;
 }
@@ -81,6 +82,8 @@ export interface CursorListOptions {
 /* -------------------------------------------------------------------------- */
 
 export interface GetCaseByCnrOptions {
+  /** Hearing history and advocates, at no extra charge. */
+  include?: readonly CaseInclude[];
   /**
    * When the CNR is not in the corpus, start a live court portal fetch.
    * The call that starts it returns `pending` and is free; the poll that
@@ -100,8 +103,12 @@ export interface CnrLookupData {
   /** Canonical 16 character CNR. */
   cnr: string;
   status: CnrLookupStatus;
-  /** Present when `status` is `found`, same shape as `GET /cases/{id}`. */
-  case?: Record<string, unknown> | null;
+  /**
+   * Present when `status` is `found`, the same record `getCase` returns
+   * (including `bench`, `courtRecordActs` and `courtRecordFir` where held).
+   * Null while `pending`.
+   */
+  case?: (CaseDetails & Record<string, unknown>) | null;
   /** Present when `status` is `pending`. Opaque: poll the same `getCaseByCnr` call; it is not accepted by `getTimeline`. */
   requestId?: string | null;
 }
@@ -247,6 +254,12 @@ export interface ChangeEvent<TData = Record<string, unknown>> {
   createdAt: string;
   cnr: string;
   caseId?: string | null;
+  /**
+   * Present only when the case was removed after this event was recorded.
+   * The event keeps its place in the feed, with `data` empty and `caseId`
+   * null. Queued webhook deliveries for a removed case are not sent.
+   */
+  withheld?: "case_restricted" | (string & {});
   watchlists: ChangeEventWatchlistRef[];
   data: TData;
 }

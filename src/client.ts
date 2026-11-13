@@ -1,4 +1,4 @@
-import { CourtMeshError, isRetryable429Code, mapStatusToError, RateLimitError } from "./errors.js";
+import { CourtMeshError, isRetryable429Code, mapStatusToError, RateLimitError, ValidationError } from "./errors.js";
 import type {
   AnalyzeCaseMeta,
   AnalyzeCaseOptions,
@@ -50,8 +50,61 @@ import type {
   TimelineJob,
   UsageData,
   UsageMeta,
+  GetCaseOptions,
+  CaseDocuments,
+  CaseDocumentText,
+  CaseInclude,
+  CnrRefreshBatch,
+  CnrRefreshResult,
+  CnrRefreshState,
+  DeleteAuditActivityMeta,
+  DeleteAuditActivityOptions,
+  DeleteAuditActivityResult,
 } from "./types.js";
+import type {
+  PartyProfileAccepted,
+  PartyProfileMeta,
+  PartyProfileOptions,
+  PartyProfileRequestMeta,
+  PartyProfileRequestStatus,
+  PartyProfileResult,
+} from "./party-profile.js";
 import { normalizeCnr } from "./monitoring.js";
+import {
+  assertCheckBody,
+  assertCourtListQuery,
+  assertDateRange,
+  assertMatterId,
+  LISTINGS_MAX_DAYS,
+} from "./cause-lists.js";
+import type {
+  CauseListCheckData,
+  CauseListCourtList,
+  CauseListingsResponse,
+  CauseListing,
+  CauseListMeta,
+  CheckCauseListsOptions,
+  GetCourtCauseListOptions,
+  ListCauseListingsOptions,
+  CauseListRangeOptions,
+  MatterCauseListings,
+} from "./cause-lists.js";
+import type {
+  ActHistoryResponse,
+  ActResolutionResponse,
+  ActResponse,
+  ActSectionResponse,
+  CitingCase,
+  CitingCasesResponse,
+  ListActSectionsOptions,
+  ListActSectionsResponse,
+  ListSectionCitingCasesOptions,
+  SearchActsOptions,
+  SearchActsResponse,
+  SearchSectionsOptions,
+  SearchSectionsResponse,
+  SectionLookupResponse,
+} from "./acts.js";
 import type {
   AddWatchlistItemsResult,
   ChangeEvent,
@@ -82,7 +135,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.5.0";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.6.0";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 
@@ -141,9 +194,9 @@ export interface RequestConfig {
   retryPosts?: boolean;
   /**
    * Only meaningful on the POST methods that accept an `Idempotency-Key`
-   * header: `screenParty`, `screenPartyBatch`, `analyzeCase`,
+   * header: `screenParty`, `screenPartyBatch`, `buildPartyProfile`, `analyzeCase`,
    * `analyzeConsolidated`, `requestTimeline`, `createWatchlist`,
-   * `addWatchlistItems`, `createWebhook`. (`rotateWebhookSecret`,
+   * `addWatchlistItems`, `createWebhook`, `checkCauseLists`. (`rotateWebhookSecret`,
    * `testWebhook` and `retryWebhookDelivery` accept the option too, but the
    * server does not deduplicate them.) 1 to 128 characters,
    * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
@@ -180,10 +233,28 @@ const ENDPOINT_TIMEOUT_MS = {
   requestTimeline: 240_000,
   analyzeConsolidated: 300_000,
   screenParty: 90_000,
+  buildPartyProfile: 90_000,
 } as const;
+
+/**
+ * The 503 codes on `POST /party/profile` that refused before any work or
+ * charge. Any other 503 on that call (including one whose debit outcome is
+ * unknown) is never retried automatically, whatever `retryPosts` says.
+ */
+const PARTY_PROFILE_SAFE_503_CODES: ReadonlySet<string> = new Set([
+  "ACCOUNT_STANDING_UNAVAILABLE",
+  "ENTITLEMENT_UNAVAILABLE",
+]);
+
+/** Matches the `requestId` of a full party profile: `ppr_` and 32 lowercase hex characters. */
+const PARTY_PROFILE_REQUEST_ID = /^ppr_[0-9a-f]{32}$/;
 
 /** The maximum number of pages an async iterator will walk before it gives up as a safety guard. */
 const MAX_ITERATOR_PAGES = 10000;
+
+function includeQuery(include: readonly CaseInclude[] | undefined): { include: string } | undefined {
+  return include?.length ? { include: include.join(",") } : undefined;
+}
 
 /** Canonical CNR when the input normalises, else the trimmed input so the server can answer `INVALID_CNR`. */
 function cnrForRequest(cnr: string): string {
@@ -290,6 +361,18 @@ interface RequestOptions {
   retryPosts?: boolean;
   /** Sent as the `Idempotency-Key` header when present. See `RequestConfig.idempotencyKey`. */
   idempotencyKey?: string;
+  /**
+   * When true, the request is never retried once it may have reached the
+   * server (a network error, a timeout, or a 5xx), whatever the method or
+   * `retryPosts` say. A 429 with a retryable code is still retried, since it
+   * is a refusal before any work.
+   */
+  noRetryAfterDispatch?: boolean;
+  /**
+   * When set, a 503 is retried (subject to the other rules) only when its
+   * `code` is in this set. Any other 503 is thrown at once.
+   */
+  retryable503Codes?: ReadonlySet<string>;
 }
 
 /**
@@ -367,11 +450,11 @@ export class CourtMeshClient {
    * tiers allow more, but 20 is a safe default for every tier).
    *
    * Cursor-first: once a page's `pagination.nextCursor` comes back, it is
-   * passed back as `cursor` on the next call (the current, self-serve
-   * pagination mechanism) rather than incrementing `page`. If the account
-   * is on the legacy path instead, `nextCursor` comes back as a raw array
+   * passed back as `cursor` on the next call (the current
+   * pagination mechanism) rather than incrementing `page`. On the legacy path,
+   * `nextCursor` comes back as a raw array
    * and this walks it via `searchAfter` instead - either way, you never have
-   * to branch on which shape your account gets. `PAGE_LIMIT_EXCEEDED` and
+   * to branch on the shape. `PAGE_LIMIT_EXCEEDED` and
    * `PAGINATION_DEPTH_EXCEEDED` surface as a typed `ValidationError`, same as
    * calling `searchCases` directly.
    */
@@ -401,7 +484,7 @@ export class CourtMeshClient {
 
       const nextCursor = response.pagination.nextCursor;
       if (typeof nextCursor === "string" && nextCursor.length > 0) {
-        // Current, self-serve mechanism: hand the signed cursor straight back.
+        // Current mechanism: hand the signed cursor straight back.
         cursor = nextCursor;
         searchAfter = undefined;
       } else if (Array.isArray(nextCursor) && nextCursor.length > 0) {
@@ -427,8 +510,7 @@ export class CourtMeshClient {
 
   /**
    * Defensive fallback only: the server sends a proper non-200 status for a
-   * semantic search failure today (`sendSemanticFailure`,
-   * `routes/api-v1-prod.ts`), so this branch should never trigger in
+   * semantic search failure today, so this branch should never trigger in
    * practice. It stays as a belt-and-braces check in case a future response
    * ever starts streaming before failing.
    */
@@ -485,10 +567,58 @@ export class CourtMeshClient {
   /* 4. GET /cases/{id}                                                     */
   /* ---------------------------------------------------------------------- */
 
-  async getCase(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
+  /**
+   * Pass `{ include: ["hearings", "advocates"] }` for hearing history and
+   * advocates, at no extra charge. Either can come back `null` when we hold no
+   * such record for this case, and empty when we hold it and it lists none.
+   */
+  async getCase(id: string, options: GetCaseOptions = {}): Promise<ApiResponse<CaseDetails, GetCaseMeta>> {
     return this.request<ApiResponse<CaseDetails, GetCaseMeta>>({
       method: "GET",
       path: `/cases/${encodeURIComponent(id)}`,
+      query: includeQuery(options.include),
+      timeoutMs: options.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /cases/{id}/orders                                                 */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Lists the documents we hold for a case, newest first, with what is
+   * available for each. Read `textAvailable` before asking for the text: not
+   * every order has readable text. 1 credit.
+   */
+  async listCaseOrders(id: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CaseDocuments>> {
+    return this.request<ApiResponse<CaseDocuments>>({
+      method: "GET",
+      path: `/cases/${encodeURIComponent(id)}/orders`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /cases/{id}/orders/{documentId}/text                               */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Reads the stored text of one document of a case. 2 credits when text is
+   * returned; when we hold none, `data.textAvailable` is `false`, `data.text`
+   * is `null` and the call is free. Calls that return text count against a
+   * monthly allowance (`ORDER_TEXT_LIMIT_REACHED`). The text is machine read
+   * from the court document, so check anything you rely on against the
+   * original. Taken down and masked matters throw `PermissionDeniedError`
+   * (`CASE_RESTRICTED`).
+   */
+  async getCaseDocumentText(
+    id: string,
+    documentId: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<CaseDocumentText>> {
+    return this.request<ApiResponse<CaseDocumentText>>({
+      method: "GET",
+      path: `/cases/${encodeURIComponent(id)}/orders/${encodeURIComponent(documentId)}/text`,
       timeoutMs: requestOptions.timeoutMs,
     });
   }
@@ -701,15 +831,15 @@ export class CourtMeshClient {
   /* ---------------------------------------------------------------------- */
 
   /**
-   * Check API health. No auth required, not rate limited beyond the public
+   * Check API health. No auth required, rate limited by the public
    * health limiter.
    *
    * The plain form (`deep` omitted or false) is a cheap liveness probe: no
    * dependency calls, always fast, always HTTP 200 while the process is up.
-   * Pass `deep: true` to also check Mongo, OpenSearch, Qdrant, Redis and IAM
+   * Pass `deep: true` to also check each backing dependency's
    * standing (each bounded to 1s) - `status` then also reports `"degraded"`,
-   * and HTTP 503 (`status: "unhealthy"`) when a hard dependency (Mongo or
-   * OpenSearch) is down. Unlike every other endpoint, the response is not
+   * and HTTP 503 (`status: "unhealthy"`) when a hard dependency is
+   * down. Unlike every other endpoint, the response is not
    * enveloped in `data`.
    */
   async health(options: { deep?: boolean } = {}, requestOptions: RequestConfig = {}): Promise<HealthResponse> {
@@ -759,6 +889,66 @@ export class CourtMeshClient {
         endDate: options.endDate,
       },
       timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* DELETE /audit                                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Permanently deletes this API key's own activity before `before`.
+   * **This cannot be undone.** Those calls are no longer listed by `audit()`,
+   * and the request details kept with them for your account (what was sent,
+   * IP address, user agent) are erased. Only the calling key's own activity
+   * is touched; other keys on the account are not. Needs the `account`
+   * scope, like `audit()`. Free and unmetered. What you were charged stays
+   * on your invoices, credit balance and usage totals.
+   *
+   * A large history is removed in parts: when `data.complete` is false, call
+   * this again with the same `before` to finish.
+   *
+   * Never retried automatically once it may have reached the server (a
+   * network error, a timeout or a 5xx): the outcome is then unknown, so read
+   * `audit()` to see where it stands before you call it again. A 429
+   * `RATE_LIMITED` refusal is still retried, since nothing ran.
+   *
+   * `before` must be a full date and time with `Z` or an offset (or a
+   * `Date`), not in the future; otherwise `ValidationError`. A `Date` is sent
+   * as its UTC ISO string. An invalid `Date` or an empty string throws
+   * `ValidationError` before a request is sent.
+   */
+  async deleteAuditActivityBefore(
+    options: DeleteAuditActivityOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<DeleteAuditActivityResult, DeleteAuditActivityMeta>> {
+    const raw = options?.before;
+    let before: string;
+    if (raw instanceof Date) {
+      if (Number.isNaN(raw.getTime())) {
+        throw new ValidationError("before must be a valid date and time.", undefined, undefined, undefined, undefined, {
+          apiCode: "VALIDATION_ERROR",
+        });
+      }
+      before = raw.toISOString();
+    } else if (typeof raw === "string" && raw.trim().length > 0) {
+      before = raw.trim();
+    } else {
+      throw new ValidationError(
+        "before is required: a date and time with Z or an offset, for example 2026-11-05T00:00:00Z.",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { apiCode: "VALIDATION_ERROR" },
+      );
+    }
+    return this.request<ApiResponse<DeleteAuditActivityResult, DeleteAuditActivityMeta>>({
+      method: "DELETE",
+      path: "/audit",
+      query: { before },
+      timeoutMs: requestOptions.timeoutMs,
+      noRetryAfterDispatch: true,
     });
   }
 
@@ -827,6 +1017,119 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* POST /party/profile                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Builds a litigation profile of a person or company: everything
+   * `screenParty` finds, grouped into identities, with each case's court,
+   * bench, status, next hearing, acts and FIR as the court record states
+   * them, and the documents held for it. Takes every `screenParty` option
+   * plus `mode`, `maxCredits`, `webhook`, `minConfidence`, `include` and
+   * `allowUnconfirmedPrimary`. `purpose` is required, as on `screenParty`.
+   * Not available on the Free tier (`PermissionError`,
+   * `apiCode === "API_TIER_NOT_ALLOWED"`).
+   *
+   * Two answers, told apart by `data`:
+   * - `mode: "quick"`: the profile in one answer (`PartyProfileResult`).
+   * - `mode: "full"`: a 202 with a `requestId` (`PartyProfileAccepted`); read
+   *   the outcome with `getPartyProfileRequest`, or pass `webhook`. The
+   *   server defaults to `full` where full mode is available, so send `mode`
+   *   explicitly. Where full mode is not available, `mode: "full"` throws
+   *   `ServiceUnavailableError` with
+   *   `apiCode === "PARTY_PROFILE_FULL_UNAVAILABLE"` and nothing is charged.
+   *   An account may have at most 3 full profiles queued or running at once
+   *   (`RateLimitError`, `apiCode === "PARTY_PROFILE_TOO_MANY_ACTIVE"`, not
+   *   retried automatically).
+   *
+   * Pricing (quick mode), as the API describes it: metered, at least 100
+   * credits per profile even when no case is found. Above that, 1 credit per
+   * internal search call (at most 24), 1 per case record read and 1 per
+   * documents listing that offers a document (at most 100 cases are
+   * enriched), plus each AI review call priced by its tokens (only with
+   * `adjudicate: true`, never above an 80 credit allowance). One call never
+   * costs more than 304 credits. `meta.creditsCharged` is what left the
+   * wallet and `meta.creditsBreakdown` itemises it. The balance is checked
+   * first against the most the request could cost; a short balance throws
+   * `InsufficientCreditsError` and nothing runs. A refused or failed call
+   * charges nothing.
+   *
+   * Pricing (full mode): accepting the request costs nothing. It is then
+   * charged by actual usage, stage by stage: the search stage at the rates
+   * above, 1 credit per court refresh started (retries are free), each case
+   * analysis by its tokens, each reused analysis at the price of reading a
+   * stored analysis, and the party analysis by its tokens. `maxCredits` (100
+   * to 5000, server default 1000 or your balance if lower) is the most the
+   * request may spend, and the balance must cover it when the request is
+   * accepted.
+   *
+   * Retries: a POST is retried only with `retryPosts`, and then with an
+   * `Idempotency-Key` (yours, or one generated for you). A 503 is retried
+   * only when its `code` is `ACCOUNT_STANDING_UNAVAILABLE` or
+   * `ENTITLEMENT_UNAVAILABLE` (refused before any work). Any other 503,
+   * including one where the outcome of the debit is unknown, is thrown at
+   * once: check `usage()` before you send the request again.
+   */
+  async buildPartyProfile(
+    options: PartyProfileOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<
+    ApiResponse<PartyProfileResult, PartyProfileMeta> | ApiResponse<PartyProfileAccepted, PartyProfileRequestMeta>
+  > {
+    return this.request<
+      ApiResponse<PartyProfileResult, PartyProfileMeta> | ApiResponse<PartyProfileAccepted, PartyProfileRequestMeta>
+    >({
+      method: "POST",
+      path: "/party/profile",
+      body: options,
+      timeoutMs: requestOptions.timeoutMs ?? ENDPOINT_TIMEOUT_MS.buildPartyProfile,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
+      retryable503Codes: PARTY_PROFILE_SAFE_503_CODES,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /party/profile/{requestId}                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Where a full mode party profile stands: `status` (`queued`, `running`,
+   * `completed`, `failed`), `stage` while running, `progress` counts and
+   * `credits` charged so far. Once `status` is `completed`, `result` holds
+   * the profile. A failed request carries `failure`. Free to call.
+   *
+   * Poll every few seconds to a minute; waiting for court refreshes can take
+   * up to 25 minutes. Only the account that made the request can read it;
+   * any other id throws `NotFoundError`. The result can be read for 30 days
+   * after the request ends; after that `resultExpired` is true and only the
+   * status, progress and credits remain.
+   *
+   * `requestId` must be the `ppr_` id from the 202 answer; anything else
+   * throws `ValidationError` before a request is sent.
+   */
+  async getPartyProfileRequest(
+    requestId: string,
+    requestOptions: RequestConfig = {},
+  ): Promise<ApiResponse<PartyProfileRequestStatus, PartyProfileRequestMeta>> {
+    if (typeof requestId !== "string" || !PARTY_PROFILE_REQUEST_ID.test(requestId)) {
+      throw new ValidationError(
+        "requestId must be the requestId from the accepted profile: ppr_ followed by 32 lowercase hex characters.",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { apiCode: "VALIDATION_ERROR" },
+      );
+    }
+    return this.request<ApiResponse<PartyProfileRequestStatus, PartyProfileRequestMeta>>({
+      method: "GET",
+      path: `/party/profile/${encodeURIComponent(requestId)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* 22. GET /cases/by-cnr/{cnr}                                           */
   /* ---------------------------------------------------------------------- */
 
@@ -858,8 +1161,66 @@ export class CourtMeshClient {
     return this.request<ApiResponse<CnrLookupData, GetCaseMeta>>({
       method: "GET",
       path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
-      query: options.fetch ? { fetch: true } : undefined,
+      query: options.fetch || options.include?.length
+        ? { ...(options.fetch ? { fetch: true } : {}), ...includeQuery(options.include) }
+        : undefined,
       timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* POST /cases/by-cnr/{cnr}/refresh                                       */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Queues a fresh read from the court and answers at once. A CNR we do not
+   * hold yet is fetched too. `data.status === "queued"` costs 1 credit, charged
+   * on acceptance; every other status costs 0, including `running` when a
+   * refresh is already under way. Read progress with `getCaseRefreshState`.
+   * Not available on the Free tier.
+   */
+  async refreshCaseByCnr(cnr: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshResult>> {
+    return this.request<ApiResponse<CnrRefreshResult>>({
+      method: "POST",
+      path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}/refresh`,
+      body: {},
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
+    });
+  }
+
+  /**
+   * Where a CNR's refresh stands. Free, and counts against the daily distinct
+   * cases allowance, so poll a few at a time. `failed` when the latest attempt
+   * gave up. Not available on the Free tier.
+   */
+  async getCaseRefreshState(cnr: string, requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshState>> {
+    return this.request<ApiResponse<CnrRefreshState>>({
+      method: "GET",
+      path: `/cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}/refresh`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* POST /cases/refresh/batch                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Refreshes up to 50 CNRs in one call and answers at once, with a `status`
+   * for each. 1 credit per CNR that reaches `queued`; every other status costs
+   * 0. When the daily live fetch allowance runs out the rest answer
+   * `not_accepted` and `meta.truncated` is `true`.
+   */
+  async refreshCasesBatch(cnrs: string[], requestOptions: RequestConfig = {}): Promise<ApiResponse<CnrRefreshBatch>> {
+    return this.request<ApiResponse<CnrRefreshBatch>>({
+      method: "POST",
+      path: "/cases/refresh/batch",
+      body: { cnrs: cnrs.map(cnrForRequest) },
+      timeoutMs: requestOptions.timeoutMs,
+      retryPosts: requestOptions.retryPosts,
+      idempotencyKey: this.resolveIdempotencyKey(requestOptions),
     });
   }
 
@@ -1140,6 +1501,336 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
+  /* Acts and sections (needs the `legislation` scope)                      */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Finds acts by title, short form or subject, `GET /acts/search`. 1 credit
+   * when something is returned, nothing when nothing is. `pagination.total`
+   * counts matches before unpublished records are removed, so a page can hold
+   * fewer rows than `limit`. `meta.weakMatch` is true when nothing matched
+   * closely. Check `repealed` on each act before relying on it.
+   */
+  async searchActs(options: SearchActsOptions, requestOptions: RequestConfig = {}): Promise<SearchActsResponse> {
+    return this.request<SearchActsResponse>({
+      method: "GET",
+      path: "/acts/search",
+      query: {
+        q: options.query,
+        docClass: options.docClass,
+        jurisdiction: options.jurisdiction,
+        yearFrom: options.yearFrom,
+        yearTo: options.yearTo,
+        page: options.page,
+        limit: options.limit,
+      },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Turns what a lawyer writes ("IPC", "NI Act") into the act,
+   * `GET /acts/resolve`. Returns up to five candidates, best first. Same
+   * pricing as `searchActs`.
+   */
+  async resolveAct(query: string, requestOptions: RequestConfig = {}): Promise<ActResolutionResponse> {
+    return this.request<ActResolutionResponse>({
+      method: "GET",
+      path: "/acts/resolve",
+      query: { q: query },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * One act's details and repeal status, without its text,
+   * `GET /acts/{slug}`. An unknown slug throws `NotFoundError` with
+   * `apiCode === "ACT_NOT_FOUND"` and costs nothing. 1 credit otherwise.
+   */
+  async getAct(slug: string, requestOptions: RequestConfig = {}): Promise<ActResponse> {
+    return this.request<ActResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * What repealed an act and what amended it, `GET /acts/{slug}/history`.
+   * This is act level only: it does not map old sections to new ones. An
+   * unknown slug throws `NotFoundError` (`ACT_NOT_FOUND`). 1 credit.
+   */
+  async getActHistory(slug: string, requestOptions: RequestConfig = {}): Promise<ActHistoryResponse> {
+    return this.request<ActHistoryResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/history`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * The provisions of an act in order, without their text,
+   * `GET /acts/{slug}/sections`. An act published only as one document has
+   * none (see `textSource` on `getAct`). An unknown slug throws
+   * `NotFoundError` (`ACT_NOT_FOUND`). 1 credit when rows come back.
+   */
+  async listActSections(
+    slug: string,
+    options: ListActSectionsOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<ListActSectionsResponse> {
+    return this.request<ListActSectionsResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections`,
+      query: { page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * One provision's full text, structured into blocks, with its amendment
+   * notes and repeal status, `GET /acts/{slug}/sections/{sectionSlug}`. An
+   * unknown act or provision throws `NotFoundError` with
+   * `apiCode === "SECTION_NOT_FOUND"`, at no charge. 1 credit otherwise.
+   */
+  async getActSection(slug: string, sectionSlug: string, requestOptions: RequestConfig = {}): Promise<ActSectionResponse> {
+    return this.request<ActSectionResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections/${encodeURIComponent(sectionSlug)}`,
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Judgments citing exactly this provision, newest first,
+   * `GET /acts/{slug}/sections/{sectionSlug}/citing-cases`. A search for
+   * section 302 of the Penal Code does not return judgments that cite only
+   * its successor.
+   *
+   * This is not an exhaustive list of every judgment applying the provision,
+   * and an empty list does not mean no judgment applied it. `listAvailable`
+   * is false for a provision we do not list judgments for, including sexual
+   * offences and cruelty provisions. Some matters are never listed. A page
+   * can hold fewer rows than `limit`, or none, while `pagination.hasMore` is
+   * true, so keep following `pagination.nextCursor`; it is opaque, so pass it
+   * back unchanged. Read a judgment with `getCase(id)`. A failed check
+   * throws `BadGatewayError` (`UPSTREAM_UNAVAILABLE`), is free and is safe to
+   * retry. 1 credit when cases come back.
+   */
+  async listSectionCitingCases(
+    slug: string,
+    sectionSlug: string,
+    options: ListSectionCitingCasesOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CitingCasesResponse> {
+    return this.request<CitingCasesResponse>({
+      method: "GET",
+      path: `/acts/${encodeURIComponent(slug)}/sections/${encodeURIComponent(sectionSlug)}/citing-cases`,
+      query: { cursor: options.cursor, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `listSectionCitingCases`, yielding one page of judgments at a time
+   * until `nextCursor` is null. An empty page in the middle is skipped over, not
+   * treated as the end. The same caveats apply: the list is not exhaustive.
+   */
+  iterSectionCitingCases(
+    slug: string,
+    sectionSlug: string,
+    options: ListSectionCitingCasesOptions = {},
+  ): AsyncGenerator<CitingCase[], void, unknown> {
+    return this.iterCursor(
+      "iterSectionCitingCases",
+      options,
+      async (o) => {
+        const res = await this.listSectionCitingCases(slug, sectionSlug, o);
+        return { success: true as const, data: res.data.cases, pagination: res.pagination };
+      },
+      false,
+    );
+  }
+
+  /**
+   * Full text search across provisions, with a short snippet per row,
+   * `GET /sections/search`. Narrow it with `act` (a slug) or `number`. Same
+   * pricing and `pagination.total` caveat as `searchActs`.
+   */
+  async searchSections(options: SearchSectionsOptions, requestOptions: RequestConfig = {}): Promise<SearchSectionsResponse> {
+    return this.request<SearchSectionsResponse>({
+      method: "GET",
+      path: "/sections/search",
+      query: { q: options.query, act: options.act, number: options.number, page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Turns shorthand such as "section 302 IPC", "s.138 NI Act" or "Article 21"
+   * into the provision it names, `GET /sections/lookup`. A lettered section
+   * keeps its letter. "Order VII Rule 11 CPC" is not resolved and returns no
+   * match. `ambiguous` is true on a match when no act was named: choose or
+   * name the act. 1 credit when something is returned.
+   */
+  async lookupSection(citation: string, requestOptions: RequestConfig = {}): Promise<SectionLookupResponse> {
+    return this.request<SectionLookupResponse>({
+      method: "GET",
+      path: "/sections/lookup",
+      query: { q: citation },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Cause lists                                                            */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * One page of the listings found for the matters in your account, within a
+   * date range of at most 31 days (default: today and the next 7 days).
+   * Needs the `causelist` scope. 1 credit per successful call; a failed call
+   * is not charged. Only listings that were found are returned: an empty page
+   * does not mean a matter is not listed. Pages start at 1.
+   *
+   * Throws `ValidationError` for a bad date range before any request is
+   * sent (`page` and `limit` are checked by the server). A temporary outage is
+   * `BadGatewayError` (`UPSTREAM_UNAVAILABLE`, not charged; GET calls are
+   * retried by the client before it is thrown); an account without cause list access is
+   * `PermissionError` (`CAUSE_LISTS_NOT_ENABLED`).
+   */
+  async listCauseListings(
+    options: ListCauseListingsOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<CauseListingsResponse> {
+    assertDateRange(options, LISTINGS_MAX_DAYS);
+    return this.request<CauseListingsResponse>({
+      method: "GET",
+      path: "/cause-lists/listings",
+      query: { from: options.from, to: options.to, page: options.page, limit: options.limit },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `listCauseListings`, yielding one page of listings at a time until
+   * `pagination.hasMore` is false. Each page is one call and one credit.
+   * `PAGE_LIMIT_EXCEEDED` and `PAGINATION_DEPTH_EXCEEDED` surface as
+   * `ValidationError`, as on search.
+   */
+  async *iterCauseListings(
+    options: ListCauseListingsOptions = {},
+  ): AsyncGenerator<CauseListing[], void, unknown> {
+    let page = options.page ?? 1;
+    for (let i = 0; i < MAX_ITERATOR_PAGES; i++) {
+      const response = await this.listCauseListings({ ...options, page });
+      const data = response.data ?? [];
+      if (data.length > 0) yield data;
+      if (data.length === 0 || !response.pagination?.hasMore) return;
+      page += 1;
+    }
+    throw new Error(
+      `iterCauseListings exceeded the safety guard of ${MAX_ITERATOR_PAGES} pages. This usually means ` +
+        "the server keeps reporting hasMore: true without making progress.",
+    );
+  }
+
+  /**
+   * The listings found for one matter in your account (`matterId` is its 24
+   * character id), within a date range of at most 31 days. 1 credit per
+   * successful call. An unknown matter throws `NotFoundError`
+   * (`MATTER_NOT_FOUND`), not charged.
+   */
+  async listMatterCauseListings(
+    matterId: string,
+    options: CauseListRangeOptions = {},
+    requestOptions: RequestConfig = {},
+  ): Promise<{ success: true; data: MatterCauseListings; meta?: CauseListMeta; requestId?: string }> {
+    assertMatterId(matterId);
+    assertDateRange(options, LISTINGS_MAX_DAYS);
+    return this.request({
+      method: "GET",
+      path: `/matters/${encodeURIComponent(matterId)}/cause-listings`,
+      query: { from: options.from, to: options.to },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * The published list of one court for one date, for a court you have an
+   * open matter in. `data.status` says what was read: `ok` and `partial`
+   * carry rows (1 credit); `none`, `empty`, `not_published`, `invalid_court`
+   * and `unavailable` are a 200 with no rows and cost 0 (read
+   * `meta.creditsCharged`). The call still needs 1 credit available when it
+   * starts. A court with no open matter of yours throws `NotFoundError`
+   * (`COURT_LIST_NOT_FOUND`), not charged.
+   */
+  async getCourtCauseList(
+    options: GetCourtCauseListOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<{ success: true; data: CauseListCourtList; meta?: CauseListMeta; requestId?: string }> {
+    assertCourtListQuery(options);
+    return this.request({
+      method: "GET",
+      path: "/cause-lists/court",
+      query: { courtKey: options.courtKey, date: options.date },
+      timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Checks whether 1 to 100 CNRs that your account watches appear on a stored
+   * cause list, for a range of at most 7 days (default: today and tomorrow,
+   * Indian calendar). Needs the `causelist` scope. The call never contacts a
+   * court: it reads lists already held.
+   *
+   * Each result has a `status`:
+   * - `listed`: a row of the case was found (1 credit).
+   * - `no_entry_found`: a list was read and no row was recognised (1 credit).
+   *   This is not proof that the case is not listed; `dates[].complete` says
+   *   how much was read.
+   * - `list_not_read`, `cannot_check`, `not_watched`: free.
+   *
+   * At most 100 CNRs, and the number of distinct CNRs times the number of
+   * dates in the range (inclusive, 2 by default) at most 300; both are
+   * checked before a request is sent. Repeats of a CNR are ignored.
+   *
+   * Price: 1 credit per CNR with status `listed` or `no_entry_found`, settled
+   * once for the whole call (`meta.creditsCharged`). The call also needs at
+   * least 1 credit available when it starts: a balance below the number of
+   * watched CNRs in it throws `InsufficientCreditsError`. The same error can
+   * arrive after the answer is ready, when the credits due cannot be settled;
+   * no results are returned then. A `ServiceUnavailableError` with
+   * `apiCode === "SETTLEMENT_UNCONFIRMED"` means the charge outcome is unknown:
+   * it is never retried automatically, even with `retryPosts`, and you should
+   * check your balance (`usage()`) first. Repeating the call with the same
+   * `Idempotency-Key` is refused with 409 `IDEMPOTENCY_IN_PROGRESS` for up to
+   * 24 hours. A 503 `ENTITLEMENT_UNAVAILABLE` ran nothing and is safe to retry.
+   *
+   * `data.from` and `data.to` are the dates that were looked at (the default
+   * range is resolved by the server). Only positive listings are reported. A
+   * temporary outage is `BadGatewayError` (`UPSTREAM_UNAVAILABLE`) for the
+   * whole call, not charged. Accepts an `Idempotency-Key` like the other
+   * POST calls.
+   */
+  async checkCauseLists(
+    options: CheckCauseListsOptions,
+    requestOptions: RequestConfig = {},
+  ): Promise<{
+    success: true;
+    data: CauseListCheckData;
+    meta?: CauseListMeta;
+    requestId?: string;
+    replayed?: boolean;
+  }> {
+    assertCheckBody(options);
+    const body: Record<string, unknown> = { cnrs: options.cnrs.map(cnrForRequest) };
+    if (options.from !== undefined) body.from = options.from;
+    if (options.to !== undefined) body.to = options.to;
+    return this.postJson("/cause-lists/check", body, requestOptions);
+  }
+
+  /* ---------------------------------------------------------------------- */
   /* Internals                                                              */
   /* ---------------------------------------------------------------------- */
 
@@ -1240,7 +1931,8 @@ export class CourtMeshClient {
     // GET and DELETE are idempotent, so they are retried by default; POST and
     // PATCH are retried only on opt-in.
     const canRetryAfterDispatch =
-      opts.method === "GET" || opts.method === "DELETE" || (opts.retryPosts ?? this.retryPosts);
+      !opts.noRetryAfterDispatch &&
+      (opts.method === "GET" || opts.method === "DELETE" || (opts.retryPosts ?? this.retryPosts));
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();
@@ -1312,7 +2004,18 @@ export class CourtMeshClient {
 
         // Not a retryable code (a daily/monthly cap, R2) or attempts are
         // exhausted: fall through to the generic throw below.
-      } else if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxAttempts && canRetryAfterDispatch) {
+      } else if (
+        RETRYABLE_STATUS_CODES.has(response.status) &&
+        attempt < maxAttempts &&
+        canRetryAfterDispatch &&
+        // The charge outcome is unknown: a retry could charge again, whatever retryPosts says.
+        !(response.status === 503 && extractApiCode(json) === "SETTLEMENT_UNCONFIRMED") &&
+        !(
+          response.status === 503 &&
+          opts.retryable503Codes !== undefined &&
+          !opts.retryable503Codes.has(extractApiCode(json) ?? "")
+        )
+      ) {
         await delay(computeBackoffMs(attempt));
         continue;
       }

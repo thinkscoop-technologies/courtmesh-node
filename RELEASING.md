@@ -27,8 +27,8 @@ Releases are published by GitHub Actions when a `v*` tag is pushed. The workflow
 
    ```bash
    git checkout main && git pull
-   git tag v0.5.0
-   git push origin v0.5.0
+   git tag v0.6.0
+   git push origin v0.6.0
    ```
 
 5. Watch the Publish workflow. When it is green, confirm with `npm view @courtmesh/sdk version`.
