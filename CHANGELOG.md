@@ -6,6 +6,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Each entry also states which CourtMesh API behaviour the version targets,
 since some of this SDK's contract depends on your account's plan.
 
+## [0.7.0]
+
+Moves `audit()` to the access audit, because the API retired `GET /audit` on 21 Nov 2026: it now answers 410 `ENDPOINT_MOVED`, so `audit()` in 0.6.0 and earlier fails on every call. Upgrade to keep reading your audit records.
+
+### Changed (breaking)
+
+- `audit()` now calls `GET /audit/records`. Its filters are `name`, `from`, `to`, `source`, `feature`, `apiKeyId`, `userId`, `requestId`, `clientRef`, `order` (`newest` or `oldest`), `cursor` and `limit` (1 to 100, checked before a request is sent). The old `organizationId`, `offset`, `startDate` and `endDate` filters are gone.
+- The response is `data.items` (each an `AuditRecord`: who ran the call, when, which key or user, the feature, the input, a summary, the status and the request id) plus `data.nextCursor` and `data.auditEnabled`. The old `data.hits`, `data.summary`, `data.topEndpoints` and `pagination` are gone, and so are the types `AuditHit`, `AuditSummary`, `AuditTopEndpoint`, `AuditData` and `AuditPagination`.
+- For credit usage, use `usage()`.
+
+### Added
+
+- `iterAudit`, an async iterator that follows `data.nextCursor` page by page.
+- `getAuditRecordPdf(requestId)` for `GET /audit/{requestId}/pdf`: the record of one call as PDF bytes (`Uint8Array`). Free; at most 30 a minute per key.
+- Types `AuditRecord`, `AuditRecordsData` and `AuditRecordsMeta`.
+- Error codes `AUDIT_NOT_FOUND`, `AUDIT_UNAVAILABLE`, `PDF_UNAVAILABLE` and `ENDPOINT_MOVED`, in `ApiRefusalCode` and `API_REFUSAL_CODES`.
+
+### Notes
+
+- `deleteAuditActivityBefore` is unchanged. Its descriptions no longer point at `audit()`, since it deletes the key's call history, not access audit records.
+
 ## [0.6.0]
 
 Adds the Acts and sections API. These calls need the `legislation` scope and cost 1 credit when something is returned, nothing when nothing is. Adds case depth and refresh by CNR. Adds the cause list calls. They need the `causelist` scope and an account with cause lists enabled. Adds party profiles and deleting a key's own audit activity. Targets API docs 1.8.0.
