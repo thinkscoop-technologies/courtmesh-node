@@ -1309,83 +1309,86 @@ export interface MeData {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 17. GET /audit                                                             */
+/* 17. GET /audit/records (access audit)                                      */
 /* -------------------------------------------------------------------------- */
 
+/** Filters for `audit()` and `iterAudit()`. Every one is optional. */
 export interface AuditOptions {
-  /** Required if `userId` is omitted. Must be the caller's own organization, or `PermissionError`. */
-  organizationId?: string;
-  /** Required if `organizationId` is omitted. Must be the caller's own id, or an org admin's teammate, or `PermissionError`. */
-  userId?: string;
-  /** 1..200, default 50. */
-  limit?: number;
-  /** Default 0. */
-  offset?: number;
-  /** ISO 8601. */
-  startDate?: string;
-  /** ISO 8601. */
-  endDate?: string;
-}
-
-export interface AuditHit {
-  id: string;
-  userId?: string;
-  organizationId?: string;
-  endpoint: string;
-  method: string;
-  statusCode: number;
-  responseTime: number;
-  isAiAnalysis?: boolean;
-  creditsDeducted?: number;
-  /** Observed `null` in production for hits with nothing to log (for example a plain `GET /me`), not only omitted. */
-  metadata?: Record<string, unknown> | null;
   /**
-   * Live-verified 2026-09-19 against the redeployed server and its updated
-   * OpenAPI spec: `ipHash` (a SHA-256 hex digest of the caller's IP) is
-   * still sent, and remains the only IP-shaped field - raw `ipAddress` does
-   * not exist on the wire. `userAgent`, however, is no longer sent at all as
-   * of this deploy (dropped for privacy alongside raw `ipAddress`, per the
-   * endpoint's updated description); this SDK's field for it is removed.
+   * A screened name or the text of a search. Matches the exact name or text
+   * used, or any entry containing every whole word given, regardless of case,
+   * punctuation and word order. Part of a word does not match. At most 300
+   * characters.
    */
-  ipHash?: string;
-  createdAt: string;
-}
-
-export interface AuditTopEndpoint {
-  endpoint: string;
-  count: number;
-}
-
-export interface AuditSummary {
-  totalHits: number;
-  totalAiAnalysisHits: number;
-  avgResponseTime: number;
-  successfulHits: number;
-  /** A string, e.g. `"98.5"` with one decimal place. */
-  successRate: string;
-  totalCreditsDeducted: number;
-}
-
-export interface AuditData {
-  hits: AuditHit[];
-  summary: AuditSummary;
-  topEndpoints: AuditTopEndpoint[];
-}
-
-export interface AuditPagination {
-  total: number;
-  limit: number;
-  offset: number;
-  hasMore: boolean;
-}
-
-/** `GET /audit` nests its own pagination shape under the envelope, distinct from `KeywordSearchPagination`/`SemanticSearchPagination`. */
-export interface AuditResponse {
-  success: true;
-  data: AuditData;
-  pagination: AuditPagination;
+  name?: string;
+  /** Records at or after this time. A date with no time (`2026-11-20`) means the start of that day in India time. */
+  from?: string;
+  /** Records at or before this time. A date with no time means the end of that day in India time. */
+  to?: string;
+  /** `api` for calls made with a key, `web` for searches made on the website. */
+  source?: "api" | "web";
+  /** One check by its label, for example `Party screen`, in any case. */
+  feature?: string;
+  /** Only this key. Narrows what you may see, never widens it. */
+  apiKeyId?: string;
+  /** Only this user. Narrows what you may see, never widens it. */
+  userId?: string;
+  /** The `X-Request-Id` a call returned. */
   requestId?: string;
+  /** Your `X-Client-Reference`, or a batch item `clientRef`. */
+  clientRef?: string;
+  /** `newest` (default) or `oldest` first. Keep the same order when passing a cursor. */
+  order?: "newest" | "oldest";
+  /** The `nextCursor` of the previous page. */
+  cursor?: string;
+  /** 1 to 100, default 50. */
+  limit?: number;
 }
+
+/** One access audit record: who ran which call, when, with what input. */
+export interface AuditRecord {
+  id: string;
+  createdAt: string;
+  source: "api" | "web";
+  /** `Website`, or the API key name. */
+  sourceLabel: string;
+  /** Email of the user who ran it, or who owns the key. */
+  person: string | null;
+  userId: string | null;
+  apiKeyId: string | null;
+  /** The key name as it was at the time. */
+  apiKeyName: string | null;
+  /** The masked key, for example `cm-...A1b2`. */
+  apiKeyDisplay: string | null;
+  feature: string;
+  /** The screened name or search text, or for a read what was read (a CNR, a case, an act and section). */
+  inputLabel: string | null;
+  /** Verdict, counts and credits. Never a name. */
+  summary: Record<string, unknown>;
+  statusCode: number;
+  requestId: string;
+  clientRefs: string[];
+  /** Set on an idempotent replay: the original call. */
+  replayOf: Record<string, unknown> | null;
+  /** `mcp` when the calling client reported the CourtMesh MCP connector. Reported by the client, for information only. */
+  client?: "mcp" | null;
+}
+
+export interface AuditRecordsData {
+  items: AuditRecord[];
+  /** Pass as `cursor` for the next page. Null on the last page. */
+  nextCursor: string | null;
+  /** False when access audit is not switched on for your organisation. The list is then usually empty. */
+  auditEnabled: boolean;
+}
+
+export interface AuditRecordsMeta {
+  creditsCharged?: number;
+  /** A plain note, for example when access audit is not switched on. */
+  message?: string;
+}
+
+export type AuditResponse = ApiResponse<AuditRecordsData, AuditRecordsMeta>;
 
 /* -------------------------------------------------------------------------- */
 /* DELETE /audit                                                              */
@@ -1403,7 +1406,7 @@ export interface DeleteAuditActivityOptions {
 export interface DeleteAuditActivityResult {
   /** The time used, in UTC. */
   before: string;
-  /** Calls removed from `audit()` by this request. */
+  /** Calls removed from the calling key's call history by this request. */
   removed: number;
   /** False when part is left: send the same request again to finish. */
   complete: boolean;

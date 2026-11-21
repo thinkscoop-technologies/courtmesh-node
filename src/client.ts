@@ -8,6 +8,7 @@ import type {
   AnalyzeConsolidatedResult,
   ApiResponse,
   AuditOptions,
+  AuditRecord,
   AuditResponse,
   CaseAnalysis,
   CaseDetails,
@@ -135,7 +136,7 @@ import type {
  * `src/`), so `User-Agent` is never blank.
  */
 declare const __SDK_VERSION__: string;
-const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.6.0";
+const SDK_VERSION = typeof __SDK_VERSION__ !== "undefined" ? __SDK_VERSION__ : "0.7.0";
 /** Sent as `User-Agent` on every request so the server (and anyone reading a request log) can tell this SDK, and which version, made the call. */
 const USER_AGENT = `courtmesh-node/${SDK_VERSION}`;
 
@@ -251,6 +252,9 @@ const PARTY_PROFILE_REQUEST_ID = /^ppr_[0-9a-f]{32}$/;
 
 /** The maximum number of pages an async iterator will walk before it gives up as a safety guard. */
 const MAX_ITERATOR_PAGES = 10000;
+
+/** The `X-Request-Id` shape accepted by `GET /audit/{requestId}/pdf`. */
+const AUDIT_REQUEST_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 
 function includeQuery(include: readonly CaseInclude[] | undefined): { include: string } | undefined {
   return include?.length ? { include: include.join(",") } : undefined;
@@ -373,6 +377,11 @@ interface RequestOptions {
    * `code` is in this set. Any other 503 is thrown at once.
    */
   retryable503Codes?: ReadonlySet<string>;
+  /**
+   * When set, a success is read as bytes and returned as a `Uint8Array`, and
+   * must carry this content type. Errors are still read as JSON.
+   */
+  binary?: string;
 }
 
 /**
@@ -866,29 +875,111 @@ export class CourtMeshClient {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 18. GET /audit                                                        */
+  /* 18. GET /audit/records (access audit)                                  */
   /* ---------------------------------------------------------------------- */
 
   /**
-   * Fetches this API key's own logged calls (or, for an org admin, an
-   * organization's), with summary stats and a top-endpoints breakdown.
-   * Exactly one of `organizationId`/`userId` should be supplied; supplying
-   * a `userId` other than your own, or an `organizationId` you do not
-   * belong to, throws `PermissionError`.
+   * One page of your organisation's access audit: every call made with its
+   * keys and every search made on the website by its users, newest first,
+   * each naming the key or user that ran it. Free and unmetered. Needs the
+   * `account` scope.
+   *
+   * A key owned by an organisation admin sees every record of the
+   * organisation; any other key sees only its own records. For an
+   * organisation without access audit switched on, the list is empty and
+   * `data.auditEnabled` is false. Page with `cursor`: pass `data.nextCursor`
+   * until it is null, or use `iterAudit`. The full input and response of a
+   * record are in its PDF, see `getAuditRecordPdf`.
+   *
+   * Calls `GET /audit/records`. The older `GET /audit` call history was
+   * retired on 21 Nov 2026 and answers 410 `ENDPOINT_MOVED`.
+   *
+   * `limit` must be a whole number from 1 to 100, or `ValidationError` is
+   * thrown before a request is sent.
    */
   async audit(options: AuditOptions = {}, requestOptions: RequestConfig = {}): Promise<AuditResponse> {
+    const limit = options.limit;
+    if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 100)) {
+      throw new ValidationError("limit must be a whole number from 1 to 100.", undefined, undefined, undefined, undefined, {
+        apiCode: "VALIDATION_ERROR",
+      });
+    }
     return this.request<AuditResponse>({
       method: "GET",
-      path: "/audit",
+      path: "/audit/records",
       query: {
-        organizationId: options.organizationId,
+        name: options.name,
+        from: options.from,
+        to: options.to,
+        source: options.source,
+        feature: options.feature,
+        apiKeyId: options.apiKeyId,
         userId: options.userId,
-        limit: options.limit,
-        offset: options.offset,
-        startDate: options.startDate,
-        endDate: options.endDate,
+        requestId: options.requestId,
+        clientRef: options.clientRef,
+        order: options.order,
+        cursor: options.cursor,
+        limit,
       },
       timeoutMs: requestOptions.timeoutMs,
+    });
+  }
+
+  /**
+   * Walks `audit()`, yielding one page of records at a time and following
+   * `data.nextCursor` until it is null. The same filters and `order` are
+   * sent on every page.
+   */
+  async *iterAudit(options: AuditOptions = {}): AsyncGenerator<AuditRecord[], void, unknown> {
+    let cursor = options.cursor;
+    for (let i = 0; i < MAX_ITERATOR_PAGES; i++) {
+      const response = await this.audit({ ...options, cursor });
+      const items = response.data?.items ?? [];
+      if (items.length > 0) yield items;
+      const next = response.data?.nextCursor;
+      if (typeof next !== "string" || next.length === 0 || next === cursor) return;
+      cursor = next;
+    }
+    throw new Error(
+      `iterAudit exceeded the safety guard of ${MAX_ITERATOR_PAGES} pages. This usually means ` +
+        "the server keeps returning a new cursor without making progress.",
+    );
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* GET /audit/{requestId}/pdf                                             */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The access audit record of one call as a CourtMesh branded PDF, returned
+   * as its bytes. `requestId` is the `X-Request-Id` the call returned (also
+   * on each record as `requestId`). Free and unmetered; at most 30 PDFs a
+   * minute per key.
+   *
+   * The record is written just after the call's response is sent, so a fetch
+   * in the same instant can throw `NotFoundError` (`AUDIT_NOT_FOUND`): wait a
+   * second and ask again. A request id you may not see also answers
+   * `AUDIT_NOT_FOUND`. A 503 `PDF_UNAVAILABLE` is retried like any GET.
+   *
+   * `requestId` must be 1 to 128 letters, digits, `_`, `.` or `-`, or
+   * `ValidationError` is thrown before a request is sent.
+   */
+  async getAuditRecordPdf(requestId: string, requestOptions: RequestConfig = {}): Promise<Uint8Array> {
+    if (typeof requestId !== "string" || !AUDIT_REQUEST_ID.test(requestId) || /^\.+$/.test(requestId)) {
+      throw new ValidationError(
+        "requestId must be the X-Request-Id a call returned: 1 to 128 letters, digits, _, . or -.",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { apiCode: "VALIDATION_ERROR" },
+      );
+    }
+    return this.request<Uint8Array>({
+      method: "GET",
+      path: `/audit/${encodeURIComponent(requestId)}/pdf`,
+      timeoutMs: requestOptions.timeoutMs,
+      binary: "application/pdf",
     });
   }
 
@@ -898,19 +989,19 @@ export class CourtMeshClient {
 
   /**
    * Permanently deletes this API key's own activity before `before`.
-   * **This cannot be undone.** Those calls are no longer listed by `audit()`,
-   * and the request details kept with them for your account (what was sent,
+   * **This cannot be undone.** Those calls are removed from the key's call
+   * history, and the request details kept with them for your account (what was sent,
    * IP address, user agent) are erased. Only the calling key's own activity
    * is touched; other keys on the account are not. Needs the `account`
-   * scope, like `audit()`. Free and unmetered. What you were charged stays
+   * scope. Free and unmetered. What you were charged stays
    * on your invoices, credit balance and usage totals.
    *
    * A large history is removed in parts: when `data.complete` is false, call
    * this again with the same `before` to finish.
    *
    * Never retried automatically once it may have reached the server (a
-   * network error, a timeout or a 5xx): the outcome is then unknown, so read
-   * `audit()` to see where it stands before you call it again. A 429
+   * network error, a timeout or a 5xx): the outcome is then unknown. Sending
+   * the same request again yourself is safe. A 429
    * `RATE_LIMITED` refusal is still retried, since nothing ran.
    *
    * `before` must be a full date and time with `Z` or an offset (or a
@@ -1893,8 +1984,11 @@ export class CourtMeshClient {
     return url.toString();
   }
 
-  private buildHeaders(hasBody: boolean, skipAuth: boolean, idempotencyKey?: string): Record<string, string> {
-    const headers: Record<string, string> = { Accept: "application/json", "User-Agent": USER_AGENT };
+  private buildHeaders(hasBody: boolean, skipAuth: boolean, idempotencyKey?: string, accept?: string): Record<string, string> {
+    const headers: Record<string, string> = {
+      Accept: accept ? `${accept}, application/json` : "application/json",
+      "User-Agent": USER_AGENT,
+    };
     if (!skipAuth && this.apiKey) {
       headers.Authorization = `Bearer ${this.apiKey}`;
     }
@@ -1942,7 +2036,7 @@ export class CourtMeshClient {
       try {
         response = await this.fetchImpl(url, {
           method: opts.method,
-          headers: this.buildHeaders(opts.body !== undefined, opts.skipAuth ?? false, opts.idempotencyKey),
+          headers: this.buildHeaders(opts.body !== undefined, opts.skipAuth ?? false, opts.idempotencyKey, opts.binary),
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
           signal: controller.signal,
         });
@@ -1965,7 +2059,15 @@ export class CourtMeshClient {
       }
       if (timer) clearTimeout(timer);
 
-      const text = await response.text();
+      const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+      let bytes: Uint8Array | undefined;
+      let text: string;
+      if (opts.binary && !contentType.includes("json")) {
+        bytes = new Uint8Array(await response.arrayBuffer());
+        text = "";
+      } else {
+        text = await response.text();
+      }
       let json: unknown;
       if (text.length > 0) {
         try {
@@ -2022,6 +2124,19 @@ export class CourtMeshClient {
 
       if (!response.ok) {
         throw mapStatusToError(response.status, extractErrorMessage(json, response.status), json, headerRequestId);
+      }
+
+      if (opts.binary) {
+        if (bytes === undefined || !contentType.includes(opts.binary)) {
+          throw new CourtMeshError(
+            `Expected ${opts.binary} but the response was ${contentType || "of no stated type"}.`,
+            "unknown_error",
+            response.status,
+            json,
+            { requestId: headerRequestId },
+          );
+        }
+        return bytes as T;
       }
 
       if (isRecord(json)) {

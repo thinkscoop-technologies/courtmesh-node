@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { CourtMeshClient } from "../src/client.js";
-import { CourtMeshError } from "../src/errors.js";
+import { CourtMeshError, NotFoundError } from "../src/errors.js";
 import { queueFetch } from "./helpers.js";
 
 const API_KEY = "cm-abcdefghij1234567890abcdefghijkl-wxyz";
@@ -853,69 +853,224 @@ describe("17. me", () => {
   });
 });
 
-describe("18. audit", () => {
-  it("sends query params and unwraps hits, summary and pagination", async () => {
+describe("18. audit (GET /audit/records)", () => {
+  const record = {
+    id: "673d9a1f2c4b5e6f7a8b9c0d",
+    createdAt: "2026-11-20T09:15:02.000Z",
+    source: "api",
+    sourceLabel: "API key: Production",
+    person: "ops@example.com",
+    userId: "673d9a1f2c4b5e6f7a8b9c02",
+    apiKeyId: "673d9a1f2c4b5e6f7a8b9c01",
+    apiKeyName: "Production",
+    apiKeyDisplay: "cm-...A1b2",
+    feature: "Party screen",
+    inputLabel: "Example Person",
+    summary: { verdict: "matches_found", matchCount: 2, creditsCharged: 5 },
+    statusCode: 200,
+    requestId: "9b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+    clientRefs: ["candidate-3381"],
+    replayOf: null,
+  };
+
+  it("calls GET /audit/records, never the retired GET /audit", async () => {
     const { client, calls } = makeClient([
-      {
-        status: 200,
-        body: {
-          success: true,
-          data: {
-            hits: [{ id: "h1", endpoint: "/api/v1/prod/search/cases", method: "POST", statusCode: 200, responseTime: 120, createdAt: "2026-09-18T00:00:00.000Z" }],
-            summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 120, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 1 },
-            topEndpoints: [{ endpoint: "/api/v1/prod/search/cases", count: 1 }],
-          },
-          pagination: { total: 1, limit: 50, offset: 0, hasMore: false },
-        },
-      },
+      { status: 200, body: { success: true, data: { items: [record], nextCursor: null, auditEnabled: true }, meta: { creditsCharged: 0 } } },
     ]);
 
-    const result = await client.audit({ userId: "u1", limit: 50, offset: 0 });
+    const result = await client.audit();
 
-    expect(result.data.hits).toHaveLength(1);
-    expect(result.data.summary.successRate).toBe("100.0");
-    expect(result.pagination.total).toBe(1);
-    expect(calls[0]?.url).toContain("userId=u1");
-    expect(calls[0]?.url).toContain("limit=50");
+    expect(calls[0]?.method).toBe("GET");
+    expect(new URL(calls[0]!.url).pathname).toBe("/api/v1/prod/audit/records");
+    expect(new URL(calls[0]!.url).search).toBe("");
+    expect(result.data.items).toHaveLength(1);
+    expect(result.data.items[0]?.requestId).toBe(record.requestId);
+    expect(result.data.items[0]?.clientRefs).toEqual(["candidate-3381"]);
+    expect(result.data.nextCursor).toBeNull();
+    expect(result.data.auditEnabled).toBe(true);
+    expect(result.meta?.creditsCharged).toBe(0);
   });
 
-  it("accepts the live shape: hits carry ipHash, never ipAddress or userAgent", async () => {
-    // Live-verified 2026-09-19 against the redeployed server and its
-    // updated OpenAPI spec: every hit's IP field on the wire is ipHash (a
-    // SHA-256 hex digest), never raw ipAddress; userAgent is no longer sent
-    // at all as of this deploy (dropped for privacy alongside ipAddress).
-    // metadata can also be sent as an explicit null, not only omitted.
+  it("sends every filter as a query parameter", async () => {
+    const { client, calls } = makeClient([
+      { status: 200, body: { success: true, data: { items: [], nextCursor: "c2", auditEnabled: true }, meta: { creditsCharged: 0 } } },
+    ]);
+
+    const result = await client.audit({
+      name: "Example Person",
+      from: "2026-11-01",
+      to: "2026-11-20T23:59:59Z",
+      source: "api",
+      feature: "Party screen",
+      apiKeyId: "673d9a1f2c4b5e6f7a8b9c01",
+      userId: "673d9a1f2c4b5e6f7a8b9c02",
+      requestId: "req-1",
+      clientRef: "candidate-3381/row-33",
+      order: "oldest",
+      cursor: "c1",
+      limit: 100,
+    });
+
+    const params = new URL(calls[0]!.url).searchParams;
+    expect(Object.fromEntries(params)).toEqual({
+      name: "Example Person",
+      from: "2026-11-01",
+      to: "2026-11-20T23:59:59Z",
+      source: "api",
+      feature: "Party screen",
+      apiKeyId: "673d9a1f2c4b5e6f7a8b9c01",
+      userId: "673d9a1f2c4b5e6f7a8b9c02",
+      requestId: "req-1",
+      clientRef: "candidate-3381/row-33",
+      order: "oldest",
+      cursor: "c1",
+      limit: "100",
+    });
+    expect(result.data.nextCursor).toBe("c2");
+  });
+
+  it("does not send the old filters (organizationId, offset, startDate, endDate)", async () => {
+    const { client, calls } = makeClient([
+      { status: 200, body: { success: true, data: { items: [], nextCursor: null, auditEnabled: true } } },
+    ]);
+    await client.audit({ organizationId: "o1", offset: 10, startDate: "2026-01-01", endDate: "2026-02-01" } as never);
+    expect(new URL(calls[0]!.url).search).toBe("");
+  });
+
+  it("rejects a limit outside 1 to 100 before sending", async () => {
+    for (const limit of [0, 101, 1.5, Number.NaN]) {
+      const { client, calls } = makeClient([]);
+      const error = await client.audit({ limit }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CourtMeshError);
+      expect((error as CourtMeshError).code).toBe("validation_error");
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it("returns the not switched on message for an account without access audit", async () => {
     const { client } = makeClient([
       {
         status: 200,
         body: {
           success: true,
-          data: {
-            hits: [
-              {
-                id: "h1",
-                endpoint: "/api/v1/prod/me",
-                method: "GET",
-                statusCode: 200,
-                responseTime: 2,
-                createdAt: "2026-09-18T00:00:00.000Z",
-                metadata: null,
-                ipHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-              },
-            ],
-            summary: { totalHits: 1, totalAiAnalysisHits: 0, avgResponseTime: 2, successfulHits: 1, successRate: "100.0", totalCreditsDeducted: 0 },
-            topEndpoints: [{ endpoint: "/api/v1/prod/me", count: 1 }],
-          },
-          pagination: { total: 1, limit: 50, offset: 0, hasMore: false },
+          data: { items: [], nextCursor: null, auditEnabled: false },
+          meta: { creditsCharged: 0, message: "Access audit is not switched on for your organisation. Contact us to switch it on." },
         },
       },
     ]);
-
     const result = await client.audit();
+    expect(result.data.auditEnabled).toBe(false);
+    expect(result.meta?.message).toContain("not switched on");
+  });
 
-    expect(result.data.hits[0]?.ipHash).toBe("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    expect(result.data.hits[0]?.metadata).toBeNull();
-    expect("userAgent" in (result.data.hits[0] ?? {})).toBe(false);
+  it("iterAudit follows nextCursor until it is null, keeping the same filters", async () => {
+    const { client, calls } = makeClient([
+      { status: 200, body: { success: true, data: { items: [record], nextCursor: "c2", auditEnabled: true } } },
+      { status: 200, body: { success: true, data: { items: [{ ...record, id: "r2" }], nextCursor: null, auditEnabled: true } } },
+    ]);
+    const pages: string[][] = [];
+    for await (const page of client.iterAudit({ order: "oldest", limit: 1 })) pages.push(page.map((r) => r.id));
+    expect(pages).toEqual([[record.id], ["r2"]]);
+    expect(new URL(calls[1]!.url).searchParams.get("cursor")).toBe("c2");
+    expect(new URL(calls[1]!.url).searchParams.get("order")).toBe("oldest");
+  });
+
+  it("a 410 ENDPOINT_MOVED is surfaced with its code, not swallowed", async () => {
+    const { client } = makeClient([
+      {
+        status: 410,
+        body: { success: false, code: "ENDPOINT_MOVED", message: "Moved.", error: "Moved.", replacement: "/api/v1/prod/audit/records" },
+      },
+    ]);
+    const error = await client.audit().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(CourtMeshError);
+    expect((error as CourtMeshError).statusCode).toBe(410);
+    expect((error as CourtMeshError).apiCode).toBe("ENDPOINT_MOVED");
+  });
+});
+
+describe("getAuditRecordPdf (GET /audit/{requestId}/pdf)", () => {
+  const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a]);
+
+  function pdfFetch(responses: Array<() => Response>) {
+    const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+    let i = 0;
+    const fetch = async (input: string, init?: RequestInit) => {
+      calls.push({ url: input, headers: Object.fromEntries(Object.entries((init?.headers ?? {}) as Record<string, string>).map(([k, v]) => [k.toLowerCase(), v])) });
+      const next = responses[i++];
+      if (!next) throw new Error("unexpected call");
+      return next();
+    };
+    return { fetch, calls };
+  }
+
+  it("returns the PDF bytes and asks for application/pdf", async () => {
+    const { fetch, calls } = pdfFetch([
+      () => new Response(pdfBytes, { status: 200, headers: { "content-type": "application/pdf" } }),
+    ]);
+    const client = new CourtMeshClient({ apiKey: API_KEY, fetch, maxRetries: 0 });
+
+    const bytes = await client.getAuditRecordPdf("9b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e");
+
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Array.from(bytes)).toEqual(Array.from(pdfBytes));
+    expect(new URL(calls[0]!.url).pathname).toBe("/api/v1/prod/audit/9b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e/pdf");
+    expect(calls[0]?.headers.accept).toContain("application/pdf");
+    expect(calls[0]?.headers.authorization).toBe(`Bearer ${API_KEY}`);
+  });
+
+  it("maps a 404 AUDIT_NOT_FOUND JSON body to NotFoundError", async () => {
+    const { fetch } = pdfFetch([
+      () =>
+        new Response(JSON.stringify({ success: false, code: "AUDIT_NOT_FOUND", message: "No audit entry for this request id was found." }), {
+          status: 404,
+          headers: { "content-type": "application/json", "x-request-id": "rid-1" },
+        }),
+    ]);
+    const client = new CourtMeshClient({ apiKey: API_KEY, fetch, maxRetries: 0 });
+    const error = await client.getAuditRecordPdf("req-1").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NotFoundError);
+    expect((error as NotFoundError).apiCode).toBe("AUDIT_NOT_FOUND");
+    expect((error as NotFoundError).message).toBe("No audit entry for this request id was found.");
+  });
+
+  it("throws when a 200 is not a PDF", async () => {
+    const { fetch } = pdfFetch([
+      () => new Response(JSON.stringify({ success: true }), { status: 200, headers: { "content-type": "application/json" } }),
+    ]);
+    const client = new CourtMeshClient({ apiKey: API_KEY, fetch, maxRetries: 0 });
+    const error = await client.getAuditRecordPdf("req-1").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(CourtMeshError);
+    expect((error as CourtMeshError).code).toBe("unknown_error");
+  });
+
+  it("validates the request id before sending", async () => {
+    for (const bad of ["", "..", ".", "../records", "a/b", "x".repeat(129), "has space"]) {
+      const { fetch, calls } = pdfFetch([]);
+      const client = new CourtMeshClient({ apiKey: API_KEY, fetch, maxRetries: 0 });
+      const error = await client.getAuditRecordPdf(bad).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CourtMeshError);
+      expect((error as CourtMeshError).code).toBe("validation_error");
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it("retries a 503 PDF_UNAVAILABLE like any GET", async () => {
+    const { fetch, calls } = pdfFetch([
+      () => new Response(JSON.stringify({ success: false, code: "PDF_UNAVAILABLE", message: "Try again." }), { status: 503, headers: { "content-type": "application/json" } }),
+      () => new Response(pdfBytes, { status: 200, headers: { "content-type": "application/pdf" } }),
+    ]);
+    vi.useFakeTimers();
+    try {
+      const client = new CourtMeshClient({ apiKey: API_KEY, fetch, maxRetries: 1 });
+      const promise = client.getAuditRecordPdf("req-1");
+      await vi.runAllTimersAsync();
+      const bytes = await promise;
+      expect(bytes.byteLength).toBe(pdfBytes.byteLength);
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

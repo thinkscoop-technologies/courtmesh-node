@@ -521,9 +521,34 @@ Send `mode` explicitly: the server defaults to `full` where full mode is availab
 
 A short balance throws `InsufficientCreditsError` before anything runs. Full mode where it is not available throws `ServiceUnavailableError` (`PARTY_PROFILE_FULL_UNAVAILABLE`), and a fourth full profile while 3 are queued or running throws `RateLimitError` (`PARTY_PROFILE_TOO_MANY_ACTIVE`); neither is retried automatically. With `retryPosts`, the call sends an `Idempotency-Key` and is retried, but a 503 is retried only when it refused before any work (`ACCOUNT_STANDING_UNAVAILABLE`, `ENTITLEMENT_UNAVAILABLE`). Any other 503 means the charge outcome may be unknown: check `usage()` before sending it again. Poll `getPartyProfileRequest` every few seconds to a minute; a result can be read for 30 days. Pass `webhook: { url, headers }` to be told when a full profile ends; the `202` answer carries `webhook.signingSecret` once, so store it.
 
+## Access audit
+
+For organisations with access audit switched on, `audit()` lists every call made with the organisation's keys and every search made on the website by its users, newest first, with who ran it, when and with what input. A key owned by an organisation admin sees every record of the organisation; any other key sees only its own. Free. Needs the `account` scope.
+
+```ts
+const page = await client.audit({ name: "Example Person", from: "2026-11-01", to: "2026-11-20", limit: 50 });
+for (const record of page.data.items) console.log(record.createdAt, record.feature, record.inputLabel, record.requestId);
+// page.data.nextCursor: pass it as `cursor` for the next page, null on the last one.
+
+for await (const records of client.iterAudit({ source: "api", order: "oldest" })) {
+  // one page at a time
+}
+```
+
+Filters: `name`, `from`, `to`, `source` (`api` or `web`), `feature`, `apiKeyId`, `userId`, `requestId`, `clientRef`, `order` (`newest` or `oldest`), `cursor` and `limit` (1 to 100, default 50). A date with no time means that whole day in India time. For an organisation without access audit switched on, the list is empty and `data.auditEnabled` is false.
+
+`getAuditRecordPdf(requestId)` returns the record of one call as PDF bytes, using the `X-Request-Id` that call returned. The record is written just after the call returns, so a fetch in the same instant can throw `NotFoundError` (`AUDIT_NOT_FOUND`): wait a second and ask again. At most 30 PDFs a minute per key.
+
+```ts
+import { writeFile } from "node:fs/promises";
+await writeFile("record.pdf", await client.getAuditRecordPdf(requestId));
+```
+
+Since 0.7.0 `audit()` calls `GET /audit/records`. The older `GET /audit` call history was retired on 21 Nov 2026 and answers 410 `ENDPOINT_MOVED`.
+
 ## Deleting audit activity
 
-`deleteAuditActivityBefore` deletes the calling API key's own activity before a time. **This cannot be undone.** Those calls are no longer listed by `audit()`, and the request details kept with them (what was sent, IP address, user agent) are erased. Other keys on the account are not touched. What you were charged stays on your invoices, balance and usage totals. Needs the `account` scope, like `audit()`. Free.
+`deleteAuditActivityBefore` deletes the calling API key's own call history before a time. **This cannot be undone.** Those calls are removed, and the request details kept with them (what was sent, IP address, user agent) are erased. Other keys on the account are not touched. What you were charged stays on your invoices, balance and usage totals. Needs the `account` scope. Free.
 
 ```ts
 const res = await client.deleteAuditActivityBefore({ before: "2026-11-05T00:00:00Z" });
@@ -531,7 +556,7 @@ console.log(res.data.removed, res.data.complete);
 // complete is false when part is left: call it again with the same `before` to finish.
 ```
 
-`before` is a full date and time with `Z` or an offset (or a `Date`), not in the future. This call is never retried automatically once it may have reached the server (a network error, a timeout or a 5xx), because the outcome is then unknown: read `audit()` to see where it stands before calling it again. A 429 `RATE_LIMITED` refusal is still retried, since nothing ran.
+`before` is a full date and time with `Z` or an offset (or a `Date`), not in the future. This call is never retried automatically once it may have reached the server (a network error, a timeout or a 5xx), because the outcome is then unknown; sending the same request again yourself is safe. A 429 `RATE_LIMITED` refusal is still retried, since nothing ran.
 
 ## Pagination
 
